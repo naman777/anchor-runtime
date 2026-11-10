@@ -28,6 +28,7 @@ packages = ["src/anchor_runtime"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 markers = ["postgres: requires ANCHOR_TEST_DATABASE_URL"]
 
 [tool.ruff.lint]

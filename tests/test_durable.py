@@ -3,6 +3,7 @@ import sqlite3
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import replace
 from datetime import timedelta
 from threading import Barrier
@@ -11,6 +12,7 @@ from uuid import UUID
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import event, func, select, update
+from sqlalchemy.exc import OperationalError
 
 from anchor_runtime.api import create_app
 from anchor_runtime.durable import (
@@ -714,3 +716,76 @@ def test_branch_retry_reuses_committed_sibling(engine, workflow):
         "b-retry",
         "join",
     ]
+
+
+def test_database_connection_loss_after_external_commit_recovers_one_ticket(
+    engine, tmp_path
+):
+    path = tmp_path / "receiver.sqlite"
+    workflow = ticket_workflow(TicketService(path))
+    runtime = DurableRuntime(engine, [workflow], jitter=lambda: 0)
+    run_id = runtime.start(workflow.name, workflow.version, TICKET_PAYLOAD)
+    terminated = []
+
+    def disconnect_at_result(connection, _cursor, statement, *_):
+        if not statement.startswith("UPDATE tool_operations") or terminated:
+            return
+        pid = connection.connection.driver_connection.info.backend_pid
+        with engine.connect() as monitor:
+            assert monitor.scalar(select(func.pg_terminate_backend(pid, 5000)))
+        terminated.append(pid)
+
+    event.listen(engine, "before_cursor_execute", disconnect_at_result)
+    try:
+        with pytest.raises(OperationalError):
+            work_once(runtime, "disconnected")
+    finally:
+        event.remove(engine, "before_cursor_execute", disconnect_at_result)
+    assert len(terminated) == 1
+    history = runtime.inspect(run_id)
+    assert history.steps[0].output is None
+    assert history.operations[0].state == OperationState.DISPATCHING
+    with closing(sqlite3.connect(path)) as connection:
+        original = connection.execute("SELECT ticket_id FROM tickets").fetchone()[0]
+    _make_due(engine, StepRecord, run_id, lease_expires_at=func.clock_timestamp())
+    assert runtime.advance_timers()
+    assert work_once(runtime, "replacement")
+    result = runtime.inspect(run_id)
+    assert result.run.state == RunState.SUCCEEDED
+    assert result.steps[0].output["id"] == original
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute("SELECT ticket_id FROM tickets").fetchall() == [
+            (result.steps[0].output["id"],)
+        ]
+
+
+def test_concurrent_identical_approval_decisions_schedule_one_continuation(
+    engine, tmp_path
+):
+    workflow = ticket_workflow(
+        TicketService(tmp_path / "receiver.sqlite"), protected=True
+    )
+    runtime = DurableRuntime(engine, [workflow])
+    run_id = runtime.start(workflow.name, workflow.version, TICKET_PAYLOAD)
+    assert work_once(runtime, "worker")
+    (approval,) = runtime.pending_approvals()
+    barrier = Barrier(2, timeout=10)
+
+    def approve(_):
+        barrier.wait()
+        return runtime.decide_approval(
+            approval.id,
+            approval.action_digest,
+            approve=True,
+            actor="oncall",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        decisions = list(pool.map(approve, range(2)))
+    assert all(item.state == ApprovalState.APPROVED for item in decisions)
+    assert decisions[0].decided_at == decisions[1].decided_at
+    history = runtime.inspect(run_id)
+    assert sum(item.type == "approval.approved" for item in history.events) == 1
+    assert sum(item.type == "step.ready" for item in history.events) == 2
+    assert work_once(runtime, "replacement")
+    assert runtime.inspect(run_id).run.state == RunState.SUCCEEDED

@@ -189,3 +189,27 @@ The inspector omits raw model prompts and responses and redacts known
 credential fields in checkpoints. Approval arguments remain visible to
 authorized reviewers so they can verify the exact action. Keep credentials
 out of action payloads and free-form text.
+
+## Evaluation and benchmarks
+
+Set `ANCHOR_TEST_DATABASE_URL` to a PostgreSQL database whose role can
+create schemas. The harnesses create and clean up isolated schemas.
+
+```sh
+uv run python -m evals.run
+uv run python -m benchmarks.run
+uv run python -m evals.report --date YYYY-MM-DD
+```
+
+The [frozen corpus](evals/cases.jsonl) has 20 development and 40 held-out
+cases. The default evaluation runs the held-out split three times with the
+deterministic provider, comparing the parallel workflow with a single-agent
+baseline. Use `--split development` for prompt and tool changes. A paid
+evaluation is opt-in with `--provider openai --model MODEL` and
+`OPENAI_API_KEY`. Supply `--usd-per-million INPUT OUTPUT --pricing-date YYYY-MM-DD`
+to estimate known model charges from recorded usage.
+
+The benchmark uses 1,000 preloaded runs per repetition at 1, 2, 4, and 8
+worker processes. It measures the deterministic runtime separately from
+agent execution and includes a worker-exit probe using the default lease.
+Both commands save per-case or per-repetition data under `artifacts/`.

@@ -1,6 +1,8 @@
 """Evidence-driven incident investigation with a protected ticket action."""
 
+from collections.abc import Mapping
 from datetime import timedelta
+from functools import partial
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,12 +19,14 @@ from anchor_runtime.tickets import Ticket, TicketRequest, TicketService
 from anchor_runtime.tools import Tool
 
 Finding = Literal["error-regression", "latency-saturation"]
-Role = Literal["telemetry", "changes"]
+Role = Literal["telemetry", "changes", "combined"]
 MAX_ROUNDS = 4
 ROLE_TOOLS = {
     "telemetry": ("metrics", "error_logs", "latency_details"),
     "changes": ("runbook", "deployments"),
 }
+ALL_EVIDENCE_TOOLS = (*ROLE_TOOLS["telemetry"], *ROLE_TOOLS["changes"])
+EvidenceCorpus = Mapping[str, Mapping[str, tuple[Finding, str] | None]]
 
 PROMPT = (
     "Investigate the supplied synthetic incident using the listed read-only tools. "
@@ -144,12 +148,13 @@ CASE_EVIDENCE: dict[str, dict[str, tuple[Finding, str]]] = {
 }
 
 
-def _evidence_tool(name: str) -> Tool:
+def _evidence_tool(name: str, corpus: EvidenceCorpus) -> Tool:
     def read(_key: str, payload: BaseModel) -> dict | None:
         case = IncidentCase.model_validate(payload)
-        record = CASE_EVIDENCE.get(case.case_id, {}).get(name)
+        sources = corpus.get(case.case_id, {})
+        record = sources.get(name)
         if record is None:
-            return None
+            return {"error": "source unavailable"} if name in sources else None
         finding, observation = record
         return Evidence(
             id=f"{case.case_id}/{name}",
@@ -171,7 +176,10 @@ def _investigate(context: StepContext, role: Role) -> Investigation:
             escalation=reason,
         )
 
-    for round_number in range(1, MAX_ROUNDS + 1):
+    combined = role == "combined"
+    allowed_tools = ALL_EVIDENCE_TOOLS if combined else ROLE_TOOLS[role]
+    round_limit = MAX_ROUNDS * 2 if combined else MAX_ROUNDS
+    for round_number in range(1, round_limit + 1):
         try:
             decision = Decision.model_validate(
                 context.call_model(
@@ -179,7 +187,7 @@ def _investigate(context: StepContext, role: Role) -> Investigation:
                     {
                         "incident": incident.model_dump(mode="json"),
                         "role": role,
-                        "allowed_tools": list(ROLE_TOOLS[role]),
+                        "allowed_tools": list(allowed_tools),
                         "observations": {
                             name: item.model_dump(mode="json")
                             if item is not None
@@ -214,6 +222,8 @@ def _investigate(context: StepContext, role: Role) -> Investigation:
             result = context.call_tool(decision.tool, f"round-{round_number}", incident)
         except PermissionError:
             return escalate("Investigator proposed a tool outside its allowlist")
+        if isinstance(result, dict) and "error" in result:
+            return escalate(f"Evidence source {decision.tool} was unavailable")
         observations[decision.tool] = (
             Evidence.model_validate(result) if result is not None else None
         )
@@ -226,18 +236,22 @@ def _corroborated(role: Role, evidence: list[Evidence]) -> bool:
         return False
     finding = next(iter(findings))
     sources = {item.source for item in evidence}
-    if role == "telemetry":
-        detail = "error_logs" if finding == "error-regression" else "latency_details"
-        return {"metrics", detail} <= sources
-    return {"runbook", "deployments"} <= sources
+    detail = "error_logs" if finding == "error-regression" else "latency_details"
+    required = {
+        "telemetry": {"metrics", detail},
+        "changes": {"runbook", "deployments"},
+        "combined": {"metrics", detail, "runbook", "deployments"},
+    }
+    return required[role] <= sources
 
 
 def _plan(context: StepContext) -> Plan:
     incident = context.input_as(IncidentCase)
-    telemetry = context.parent_as("telemetry", Investigation)
-    changes = context.parent_as("changes", Investigation)
-    evidence = [*telemetry.evidence, *changes.evidence]
-    reasons = [item.escalation for item in (telemetry, changes) if item.escalation]
+    investigations = [
+        context.parent_as(parent, Investigation) for parent in context.parents
+    ]
+    evidence = [item for result in investigations for item in result.evidence]
+    reasons = [result.escalation for result in investigations if result.escalation]
     findings = {item.finding for item in evidence}
     if reasons or len(findings) != 1:
         summary = (
@@ -291,15 +305,24 @@ def investigation_workflow(
     provider_name: str,
     model: str,
     version: str,
+    corpus: EvidenceCorpus = CASE_EVIDENCE,
+    baseline: bool = False,
 ) -> Workflow:
+    roles = {"combined": ALL_EVIDENCE_TOOLS} if baseline else ROLE_TOOLS
+    prompt = (
+        PROMPT
+        + " For the combined role, gather both kinds of evidence before finishing."
+        if baseline
+        else PROMPT
+    )
     agent = AgentSpec(
         provider_name,
         model,
         "investigator-1",
-        PROMPT,
+        prompt,
         Decision,
         provider,
-        max_rounds=MAX_ROUNDS,
+        max_rounds=MAX_ROUNDS * 2 if baseline else MAX_ROUNDS,
     )
     nodes = tuple(
         Node(
@@ -309,12 +332,12 @@ def investigation_workflow(
             tools=tools,
             agent=agent,
             retry=RetryPolicy(),
-            timeout=timedelta(minutes=2),
+            timeout=timedelta(minutes=4 if baseline else 2),
         )
-        for role, tools in ROLE_TOOLS.items()
+        for role, tools in roles.items()
     )
     return Workflow(
-        "incident-investigation",
+        "incident-baseline" if baseline else "incident-investigation",
         version,
         IncidentCase,
         (
@@ -323,7 +346,7 @@ def investigation_workflow(
                 "plan",
                 "plan",
                 "1",
-                ("telemetry", "changes"),
+                tuple(roles),
                 routes=("ticket", "escalate"),
             ),
             Node(
@@ -339,17 +362,9 @@ def investigation_workflow(
             Node("report", "report", "1", ("ticket", "escalate"), join_selected=True),
         ),
         (
-            Handler(
-                "telemetry",
-                "1",
-                Investigation,
-                lambda context: _investigate(context, "telemetry"),
-            ),
-            Handler(
-                "changes",
-                "1",
-                Investigation,
-                lambda context: _investigate(context, "changes"),
+            *(
+                Handler(role, "1", Investigation, partial(_investigate, role=role))
+                for role in roles
             ),
             Handler("plan", "1", Plan, _plan),
             Handler("ticket", "1", Report, _ticket),
@@ -357,7 +372,7 @@ def investigation_workflow(
             Handler("report", "1", Report, _report),
         ),
         tools=(
-            *(_evidence_tool(name) for names in ROLE_TOOLS.values() for name in names),
+            *(_evidence_tool(name, corpus) for name in ALL_EVIDENCE_TOOLS),
             Tool(
                 "create_ticket",
                 "1",

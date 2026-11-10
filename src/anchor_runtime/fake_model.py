@@ -6,7 +6,17 @@ from anchor_runtime.models import ModelRequest, ModelResponse
 
 class FakeInvestigator:
     def complete(self, request: ModelRequest) -> ModelResponse:
-        action = self._decide(request.payload["role"], request.payload["observations"])
+        role, observations = request.payload["role"], request.payload["observations"]
+        if role == "combined":
+            action = self._decide("telemetry", observations)
+            if action.action == "finish":
+                changes = self._decide("changes", observations)
+                if changes.action == "finish":
+                    action.evidence_ids.extend(changes.evidence_ids)
+                else:
+                    action = changes
+        else:
+            action = self._decide(role, observations)
         return ModelResponse(action)
 
     @staticmethod
