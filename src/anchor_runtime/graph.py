@@ -9,6 +9,7 @@ from typing import TypeVar
 
 from pydantic import BaseModel
 
+from anchor_runtime.models import AgentSpec, ModelCaller
 from anchor_runtime.policy import RetryPolicy
 from anchor_runtime.tools import Tool, ToolCaller
 
@@ -27,6 +28,7 @@ class StepContext:
     parents: Mapping[str, BaseModel]
     _call_tool: ToolCaller | None = field(default=None, repr=False)
     _should_stop: Callable[[], bool] | None = field(default=None, repr=False)
+    _call_model: ModelCaller | None = field(default=None, repr=False)
 
     def call_tool(self, name: str, operation_id: str, arguments: object) -> object:
         if self._call_tool is None:
@@ -36,6 +38,11 @@ class StepContext:
     def should_stop(self) -> bool:
         """Check whether cancellation, a deadline, or lease loss ended this attempt."""
         return self._should_stop is not None and self._should_stop()
+
+    def call_model(self, round_number: int, payload: dict) -> BaseModel:
+        if self._call_model is None:
+            raise RuntimeError("Model calls require a durable worker")
+        return self._call_model(round_number, payload)
 
     def input_as(self, schema: type[Model]) -> Model:
         if not isinstance(self.run_input, schema):
@@ -75,6 +82,7 @@ class Node:
     routes: tuple[str, ...] = ()
     when: tuple[tuple[str, str], ...] = ()
     join_selected: bool = False
+    agent: AgentSpec | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "parents", tuple(self.parents))
@@ -114,6 +122,7 @@ class Workflow:
     handlers: tuple[Handler, ...]
     timeout: timedelta | None = None
     tools: tuple[Tool, ...] = ()
+    max_model_dispatches: int | None = None
     order: tuple[str, ...] = field(init=False)
     nodes_by_id: Mapping[str, Node] = field(init=False, repr=False)
     handlers_by_key: Mapping[tuple[str, str], Handler] = field(init=False, repr=False)
@@ -125,6 +134,8 @@ class Workflow:
         object.__setattr__(self, "tools", tuple(self.tools))
         if self.timeout is not None and self.timeout <= timedelta(0):
             raise ValueError("Workflow timeout must be positive")
+        if self.max_model_dispatches is not None and self.max_model_dispatches < 1:
+            raise ValueError("Workflow model dispatch budget must be positive")
         if not self.name or not self.version or not self.nodes:
             raise ValueError(
                 "Workflow name, version, and at least one node are required"

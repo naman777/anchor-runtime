@@ -52,6 +52,12 @@ class ApprovalState(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class ModelCallState(StrEnum):
+    DISPATCHING = "DISPATCHING"
+    SUCCEEDED = "SUCCEEDED"
+    REJECTED = "REJECTED"
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -211,3 +217,34 @@ class ApprovalRecord(Base):
     actor: Mapped[str | None]
     reason: Mapped[str | None]
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ModelCallRecord(Base):
+    __tablename__ = "model_calls"
+    __table_args__ = (
+        ForeignKeyConstraint(["run_id", "node_id"], ["steps.run_id", "steps.node_id"]),
+    )
+
+    run_id: Mapped[UUID] = mapped_column(primary_key=True)
+    node_id: Mapped[str] = mapped_column(primary_key=True)
+    round_number: Mapped[int] = mapped_column(primary_key=True)
+    provider: Mapped[str]
+    model: Mapped[str]
+    prompt_version: Mapped[str]
+    request_digest: Mapped[str]
+    request: Mapped[dict] = mapped_column(JSONB)
+    response: Mapped[Any] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    state: Mapped[ModelCallState] = mapped_column(
+        Enum(
+            ModelCallState,
+            native_enum=False,
+            create_constraint=True,
+            name="model_call_state",
+        )
+    )
+    dispatch_count: Mapped[int]
+    last_attempt: Mapped[int]
+    input_tokens: Mapped[int | None]
+    output_tokens: Mapped[int | None]
+    provider_reference: Mapped[str | None]
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

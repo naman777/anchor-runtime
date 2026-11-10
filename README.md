@@ -141,3 +141,33 @@ end the run and record the outcome. Cancellation through
 `POST /runs/{run_id}/cancel` closes pending approvals and fences further
 checkpoints and dispatch reservations. Handlers can check
 `context.should_stop()` for cooperative cancellation.
+
+## Incident investigator
+
+The `incident-investigation` workflow runs telemetry and change investigators
+in parallel. Each investigator can use only its registered read-only tools.
+The join verifies evidence from both branches and either escalates for human
+review or proposes a ticket. The approval includes the exact ticket arguments
+and evidence IDs.
+
+With the database, ticket receiver, and API configured as above, start a case
+and run one or more workers.
+
+```sh
+uv run python -m anchor_runtime.cli start-investigation errors checkout "Checkout errors increased"
+uv run python -m anchor_runtime.cli worker
+```
+
+Use the reviewer endpoints to approve the proposed ticket. Try `latency` to
+see a different tool path, or `missing`, `conflict`, and `injection` to see
+escalation. The default workflow uses the deterministic provider. To enable
+the optional OpenAI adapter, set `ANCHOR_OPENAI_MODEL` to a model that supports
+Structured Outputs and supply `OPENAI_API_KEY` to the API and workers. Use
+`GET /workflows` to find the separately versioned OpenAI workflow.
+
+Anchor journals each model round and its tool results. On a retry it reuses
+completed responses and records a new dispatch for a round whose response
+was lost. Each investigator has a four-round limit and the run reserves at
+most 12 dispatches across both investigators. Requests also have input size
+and output token limits. Token counts reflect usage reported and recorded
+by the provider. An interrupted dispatch may incur unobserved usage.

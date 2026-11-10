@@ -136,6 +136,20 @@ def create_app(
                 }
                 for operation in history.operations
             ],
+            "model_calls": [
+                {
+                    "node_id": call.node_id,
+                    "round": call.round_number,
+                    "provider": call.provider,
+                    "model": call.model,
+                    "prompt_version": call.prompt_version,
+                    "state": call.state,
+                    "dispatches": call.dispatch_count,
+                    "input_tokens": call.input_tokens,
+                    "output_tokens": call.output_tokens,
+                }
+                for call in history.model_calls
+            ],
         }
 
     @app.post("/runs/{run_id}/cancel", dependencies=[Depends(operator)])

@@ -1,12 +1,17 @@
 """A deterministic incident workflow for local development."""
 
 import json
+import os
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from anchor_runtime.fake_model import FakeInvestigator
 from anchor_runtime.graph import Handler, Node, StepContext, Workflow
+from anchor_runtime.investigation import investigation_workflow
+from anchor_runtime.openai_provider import OpenAIModelProvider
 from anchor_runtime.runner import run
 from anchor_runtime.tickets import TicketService, ticket_workflow
 
@@ -77,8 +82,29 @@ def demo_workflows(ticket_db: str | None = None) -> list[Workflow]:
     if ticket_db:
         service = TicketService(ticket_db)
         workflows.extend(
-            [ticket_workflow(service), ticket_workflow(service, protected=True)]
+            [
+                ticket_workflow(service),
+                ticket_workflow(service, protected=True),
+                investigation_workflow(
+                    service,
+                    FakeInvestigator(),
+                    provider_name="fake",
+                    model="incident-rules-1",
+                    version="1",
+                ),
+            ]
         )
+        if model := os.environ.get("ANCHOR_OPENAI_MODEL"):
+            model_version = sha256(model.encode()).hexdigest()[:16]
+            workflows.append(
+                investigation_workflow(
+                    service,
+                    OpenAIModelProvider(),
+                    provider_name="openai",
+                    model=model,
+                    version=f"1-openai-{model_version}",
+                )
+            )
     return workflows
 
 

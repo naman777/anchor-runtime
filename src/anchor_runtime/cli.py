@@ -27,6 +27,12 @@ def main() -> None:
     ticket.add_argument("title")
     ticket.add_argument("--key")
     ticket.add_argument("--approval", action="store_true")
+    investigate = commands.add_parser("start-investigation")
+    investigate.add_argument("case_id")
+    investigate.add_argument("service")
+    investigate.add_argument("description")
+    investigate.add_argument("--key")
+    investigate.add_argument("--version", default="1")
     worker = commands.add_parser("worker")
     worker.add_argument("--once", action="store_true")
     commands.add_parser("scheduler")
@@ -39,7 +45,7 @@ def main() -> None:
         parser.error("Set ANCHOR_DATABASE_URL to a PostgreSQL connection URL")
     logging.basicConfig(level=logging.INFO)
     ticket_db = os.environ.get("ANCHOR_TICKET_DB")
-    if args.command == "start-ticket" and not ticket_db:
+    if args.command in {"start-ticket", "start-investigation"} and not ticket_db:
         parser.error("Set ANCHOR_TICKET_DB to the mock receiver's SQLite file")
     engine = create_engine(url, pool_pre_ping=True)
     try:
@@ -51,6 +57,22 @@ def main() -> None:
             payload = {"service": args.service, "title": args.title}
             name = "approved-ticket" if args.approval else "ticket-demo"
             print(runtime.start(name, "1", payload, idempotency_key=args.key))
+        elif args.command == "start-investigation":
+            if ("incident-investigation", args.version) not in runtime.workflows:
+                parser.error("Investigation workflow version is unavailable")
+            payload = {
+                "case_id": args.case_id,
+                "service": args.service,
+                "description": args.description,
+            }
+            print(
+                runtime.start(
+                    "incident-investigation",
+                    args.version,
+                    payload,
+                    idempotency_key=args.key,
+                )
+            )
         elif args.command == "inspect":
             history = runtime.inspect(args.run_id)
             if history is None:
@@ -73,6 +95,14 @@ def main() -> None:
                     approval.node_id,
                     approval.state,
                     approval.deadline.isoformat(),
+                )
+            for call in history.model_calls:
+                print(
+                    call.node_id,
+                    call.round_number,
+                    call.model,
+                    call.state,
+                    call.dispatch_count,
                 )
         elif args.command == "worker":
             owner = f"{socket.gethostname()}:{os.getpid()}"

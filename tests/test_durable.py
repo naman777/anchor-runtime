@@ -5,15 +5,12 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import timedelta
-from pathlib import Path
 from threading import Barrier
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
-from alembic import command
-from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event, func, select, text, update
+from sqlalchemy import event, func, select, update
 
 from anchor_runtime.api import create_app
 from anchor_runtime.durable import (
@@ -42,29 +39,6 @@ from anchor_runtime.worker import work_once
 
 pytestmark = pytest.mark.postgres
 PAYLOAD = {"service": "checkout", "error_rate": 0.08}
-
-
-@pytest.fixture
-def engine():
-    url = os.environ.get("ANCHOR_TEST_DATABASE_URL")
-    if not url:
-        pytest.skip("Set ANCHOR_TEST_DATABASE_URL to run PostgreSQL integration tests")
-    schema = f"anchor_test_{uuid4().hex}"
-    admin = create_engine(url)
-    engine = create_engine(url, connect_args={"options": f"-csearch_path={schema}"})
-    try:
-        with admin.begin() as connection:
-            connection.execute(text(f"CREATE SCHEMA {schema}"))
-        config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
-        with engine.connect() as connection:
-            config.attributes["connection"] = connection
-            command.upgrade(config, "head")
-        yield engine
-    finally:
-        engine.dispose()
-        with admin.begin() as connection:
-            connection.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        admin.dispose()
 
 
 @pytest.fixture

@@ -9,12 +9,20 @@ from random import random
 from types import MappingProxyType
 from uuid import UUID, uuid4
 
+from pydantic import BaseModel
 from sqlalchemy import Engine, and_, func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from anchor_runtime.branches import Readiness, select_parents, selected_route
 from anchor_runtime.graph import Workflow
+from anchor_runtime.models import (
+    AgentSpec,
+    ModelCaller,
+    ModelLimitExceeded,
+    ModelOutputRejected,
+    ModelRequest,
+)
 from anchor_runtime.runner import encode_checkpoint, encode_input, execute_node
 from anchor_runtime.storage import (
     ApprovalRecord,
@@ -22,6 +30,8 @@ from anchor_runtime.storage import (
     AttemptRecord,
     AttemptState,
     EventRecord,
+    ModelCallRecord,
+    ModelCallState,
     OperationState,
     RunRecord,
     RunState,
@@ -66,6 +76,7 @@ class Claim:
         self,
         call_tool: ToolCaller | None = None,
         should_stop: Callable[[], bool] | None = None,
+        call_model: ModelCaller | None = None,
     ) -> str:
         return execute_node(
             self.workflow,
@@ -74,6 +85,7 @@ class Claim:
             dict(self.parent_outputs),
             call_tool,
             should_stop,
+            call_model,
         )
 
 
@@ -85,6 +97,7 @@ class RunHistory:
     events: tuple[EventRecord, ...]
     operations: tuple[ToolOperation, ...]
     approvals: tuple[ApprovalRecord, ...]
+    model_calls: tuple[ModelCallRecord, ...]
 
 
 def _json(value: object) -> str:
@@ -113,6 +126,8 @@ def _definition(workflow: Workflow) -> dict:
     # Keep the digest for pre-policy workflow definitions stable across migrations.
     if workflow.timeout is not None:
         definition["timeout"] = workflow.timeout.total_seconds()
+    if workflow.max_model_dispatches is not None:
+        definition["max_model_dispatches"] = workflow.max_model_dispatches
     for entry in definition["nodes"]:
         node = workflow.nodes_by_id[entry["id"]]
         if node.timeout is not None:
@@ -129,6 +144,18 @@ def _definition(workflow: Workflow) -> dict:
             entry["when"] = dict(node.when)
         if node.join_selected:
             entry["join_selected"] = True
+        if agent := node.agent:
+            entry["agent"] = {
+                "provider": agent.provider_name,
+                "model": agent.model,
+                "prompt_version": agent.prompt_version,
+                "instructions": agent.instructions,
+                "schema": agent.response_schema.model_json_schema(),
+                "max_rounds": agent.max_rounds,
+                "max_input_bytes": agent.max_input_bytes,
+                "max_output_tokens": agent.max_output_tokens,
+                "max_dispatches_per_round": agent.max_dispatches_per_round,
+            }
         if node.tools:
             entry["tools"] = [
                 {
@@ -505,11 +532,147 @@ class DurableRuntime:
                 claim, name, operation_id, arguments
             ),
             lambda: not self._claim_active(claim),
+            lambda round_number, payload: self.call_model(claim, round_number, payload),
         )
 
     def _claim_active(self, claim: Claim) -> bool:
         with self._sessions.begin() as session:
             return self._lock_claim(session, claim) is not None
+
+    def call_model(self, claim: Claim, round_number: int, payload: dict) -> BaseModel:
+        workflow = self.workflows[claim.workflow.name, claim.workflow.version]
+        agent = workflow.nodes_by_id[claim.node_id].agent
+        if agent is None:
+            raise PermissionError("This step has no registered model")
+        if not 1 <= round_number <= agent.max_rounds:
+            raise ModelLimitExceeded("Agent round limit exceeded")
+        encoded = _json(payload).encode()
+        if len(encoded) > agent.max_input_bytes:
+            raise ModelLimitExceeded("Agent input byte limit exceeded")
+        canonical_payload = json.loads(encoded)
+        digest = sha256(encoded).hexdigest()
+        cached = self._reserve_model_call(
+            claim,
+            round_number,
+            canonical_payload,
+            digest,
+            agent,
+            workflow.max_model_dispatches,
+        )
+        if cached is not None:
+            if cached.state == ModelCallState.REJECTED:
+                raise ModelOutputRejected("Recorded model response was rejected")
+            return agent.response_schema.model_validate_json(
+                _json(cached.response), by_name=True
+            )
+
+        response = agent.provider.complete(
+            ModelRequest(
+                agent.model,
+                agent.instructions,
+                canonical_payload,
+                agent.response_schema,
+                agent.max_output_tokens,
+            )
+        )
+        try:
+            checkpoint = encode_checkpoint(agent.response_schema, response.output)
+        except (ValueError, TypeError):
+            checkpoint = None
+        with self._sessions.begin() as session:
+            current = self._lock_claim(session, claim)
+            if current is None:
+                raise LeaseLost(
+                    "Cannot record a model response without a current lease"
+                )
+            run, step, now = current
+            call = session.get(
+                ModelCallRecord, (claim.run_id, claim.node_id, round_number)
+            )
+            call.state = (
+                ModelCallState.SUCCEEDED
+                if checkpoint is not None
+                else ModelCallState.REJECTED
+            )
+            call.response = json.loads(checkpoint) if checkpoint is not None else None
+            call.input_tokens = response.input_tokens
+            call.output_tokens = response.output_tokens
+            call.provider_reference = response.reference
+            call.finished_at = now
+            _event(
+                session,
+                run,
+                f"model.{call.state.value.lower()}",
+                now,
+                step,
+                claim.number,
+            )
+        if checkpoint is None:
+            raise ModelOutputRejected(
+                "Model response did not match the registered schema"
+            )
+        return agent.response_schema.model_validate_json(checkpoint, by_name=True)
+
+    def _reserve_model_call(
+        self,
+        claim: Claim,
+        round_number: int,
+        payload: dict,
+        digest: str,
+        agent: AgentSpec,
+        run_budget: int | None,
+    ) -> ModelCallRecord | None:
+        identity = (claim.run_id, claim.node_id, round_number)
+        with self._sessions.begin() as session:
+            current = self._lock_claim(session, claim)
+            if current is None:
+                raise LeaseLost("Cannot dispatch a model call without a current lease")
+            run, step, now = current
+            call = session.get(ModelCallRecord, identity)
+            if call is not None:
+                if call.request_digest != digest:
+                    raise ValueError(
+                        "Model round already belongs to a different request"
+                    )
+                if call.state != ModelCallState.DISPATCHING:
+                    return call
+                if (
+                    call.last_attempt == claim.number
+                    or call.dispatch_count >= agent.max_dispatches_per_round
+                ):
+                    raise ModelLimitExceeded("Model round dispatch limit exceeded")
+            elif round_number > 1:
+                prior = session.get(
+                    ModelCallRecord, (claim.run_id, claim.node_id, round_number - 1)
+                )
+                if prior is None or prior.state != ModelCallState.SUCCEEDED:
+                    raise ValueError("Model rounds must complete in order")
+            if run_budget is not None:
+                reserved = session.scalar(
+                    select(
+                        func.coalesce(func.sum(ModelCallRecord.dispatch_count), 0)
+                    ).where(ModelCallRecord.run_id == run.id)
+                )
+                if reserved >= run_budget:
+                    raise ModelLimitExceeded("Workflow model dispatch budget exceeded")
+            if call is None:
+                call = ModelCallRecord(
+                    run_id=claim.run_id,
+                    node_id=claim.node_id,
+                    round_number=round_number,
+                    provider=agent.provider_name,
+                    model=agent.model,
+                    prompt_version=agent.prompt_version,
+                    request_digest=digest,
+                    request=payload,
+                    state=ModelCallState.DISPATCHING,
+                    dispatch_count=0,
+                )
+                session.add(call)
+            call.dispatch_count += 1
+            call.last_attempt = claim.number
+            _event(session, run, "model.dispatching", now, step, claim.number)
+            return None
 
     def _require_approval(
         self,
@@ -667,6 +830,12 @@ class DurableRuntime:
         workflow = self.workflows[claim.workflow.name, claim.workflow.version]
         node = workflow.nodes_by_id[claim.node_id]
         if name not in node.tools:
+            with self._sessions.begin() as session:
+                current = self._lock_claim(session, claim)
+                if current is None:
+                    raise LeaseLost("Cannot request a tool without a current lease")
+                run, step, now = current
+                _event(session, run, "tool.denied", now, step, claim.number)
             raise PermissionError(f"Tool {name!r} is not allowed for this step")
         if not operation_id or len(operation_id) > 200:
             raise ValueError("Operation ID must contain 1 to 200 characters")
@@ -1016,6 +1185,11 @@ class DurableRuntime:
                 .where(ApprovalRecord.run_id == run_id)
                 .order_by(ApprovalRecord.node_id, ApprovalRecord.operation_id)
             )
+            model_calls = session.scalars(
+                select(ModelCallRecord)
+                .where(ModelCallRecord.run_id == run_id)
+                .order_by(ModelCallRecord.node_id, ModelCallRecord.round_number)
+            )
             return RunHistory(
                 run,
                 tuple(self._steps(session, run_id).values()),
@@ -1023,4 +1197,5 @@ class DurableRuntime:
                 tuple(events),
                 tuple(operations),
                 tuple(approvals),
+                tuple(model_calls),
             )

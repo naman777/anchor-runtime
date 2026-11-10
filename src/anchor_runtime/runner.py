@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from anchor_runtime.branches import Readiness, select_parents, selected_route
 from anchor_runtime.graph import StepContext, Workflow
+from anchor_runtime.models import ModelCaller
 from anchor_runtime.tools import ToolCaller
 
 
@@ -31,6 +32,7 @@ def execute_node(
     parent_outputs: Mapping[str, str],
     call_tool: ToolCaller | None = None,
     should_stop: Callable[[], bool] | None = None,
+    call_model: ModelCaller | None = None,
 ) -> str:
     node = workflow.nodes_by_id[node_id]
     parents = {}
@@ -49,6 +51,7 @@ def execute_node(
         parents=MappingProxyType(parents),
         _call_tool=call_tool,
         _should_stop=should_stop,
+        _call_model=call_model,
     )
     output = encode_checkpoint(handler.output_schema, handler.execute(context))
     if node.routes:
