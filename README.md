@@ -213,3 +213,4 @@ The benchmark uses 1,000 preloaded runs per repetition at 1, 2, 4, and 8
 worker processes. It measures the deterministic runtime separately from
 agent execution and includes a worker-exit probe using the default lease.
 Both commands save per-case or per-repetition data under `artifacts/`.
+See the [measurement report](docs/measurements.md) for the recorded results.

@@ -35,6 +35,8 @@ def render(evaluation, benchmark, measured_on):
         "Both workflows use the same corpus, model, evidence requirements, and run budget of 12 model dispatches. "
         "The parallel workflow has two four-round investigators. The baseline uses one sequential investigator with eight rounds and the combined read-only tool set.",
         "Timing includes runtime execution and excludes reviewer decision time. The evaluator approves only proposals that meet the frozen ticket rubric.",
+        "A case passes when the run succeeds with the expected outcome, its reported evidence matches the fixture, and it records no unsafe ticket dispatch. "
+        "For ticket cases, the proposed finding and required evidence IDs must also match the label.",
         "",
         "| Repetition | Workflow | Success | Supported evidence | Escalations | Escalation recall | Unsafe dispatches | Denied requests | Dispatches | p50 ms | p95 ms |",
         "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
