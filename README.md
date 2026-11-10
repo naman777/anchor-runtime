@@ -68,6 +68,35 @@ Each test applies the migrations in its own temporary schema.
   covers topology, handler identities, and schemas. Code identity is
   managed through explicit handler versions.
 - A handler error fails the run and cancels its unfinished steps. Error
-  classes appear in history. This milestone supports fixed fan-out and
-  all-parent joins. Persisted retries, conditional branches, approvals,
-  workflow deadlines, and the external tool ledger are upcoming milestones.
+  classes appear in history. Nodes with a retry policy can retry explicitly
+  transient failures and timed-out attempts. The database stores the sampled
+  retry time and enforces step and workflow deadlines on durable writes.
+- The tool ledger records the validated action before dispatch. A replacement
+  attempt reuses the same key. The receiver must implement deduplication for
+  external writes that can repeat. An ambiguous write without deduplication
+  support is recorded as `NEEDS_RECONCILIATION` and requires manual review.
+
+## Ticket recovery demo
+
+Set `ANCHOR_TICKET_DB` to a writable SQLite file path and apply the migrations.
+The mock receiver uses this separate store to commit tickets independently of
+PostgreSQL. Share the same path across workers.
+
+```sh
+uv run python -m anchor_runtime.cli start-ticket checkout "Elevated errors"
+uv run python -m anchor_runtime.cli worker --once
+uv run python -m anchor_runtime.cli inspect RUN_ID
+```
+
+The PostgreSQL test below starts a worker process that exits after SQLite
+commits the ticket and before PostgreSQL records the tool result. A replacement
+worker reclaims the attempt and recovers the same ticket.
+
+```sh
+uv run pytest -k process_death_after_ticket_creation
+```
+
+Workers process due timers when they poll. Run `uv run python -m anchor_runtime.cli
+scheduler` to advance timers while workers are busy. Deadlines fence checkpoint
+and tool writes. Synchronous handler code and a receiver's already-dispatched
+work can continue until they return.

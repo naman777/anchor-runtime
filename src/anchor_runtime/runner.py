@@ -7,6 +7,7 @@ from types import MappingProxyType
 from pydantic import BaseModel
 
 from anchor_runtime.graph import StepContext, Workflow
+from anchor_runtime.tools import ToolCaller
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,7 +23,11 @@ class Result:
 
 
 def execute_node(
-    workflow: Workflow, node_id: str, run_input: str, parent_outputs: Mapping[str, str]
+    workflow: Workflow,
+    node_id: str,
+    run_input: str,
+    parent_outputs: Mapping[str, str],
+    call_tool: ToolCaller | None = None,
 ) -> str:
     node = workflow.nodes_by_id[node_id]
     parents = {}
@@ -37,8 +42,9 @@ def execute_node(
     context = StepContext(
         run_input=workflow.input_schema.model_validate_json(run_input, by_name=True),
         parents=MappingProxyType(parents),
+        _call_tool=call_tool,
     )
-    return _encode_checkpoint(handler.output_schema, handler.execute(context))
+    return encode_checkpoint(handler.output_schema, handler.execute(context))
 
 
 def run(workflow: Workflow, payload: object) -> Result:
@@ -54,10 +60,10 @@ def run(workflow: Workflow, payload: object) -> Result:
 
 
 def encode_input(workflow: Workflow, payload: object) -> str:
-    return _encode_checkpoint(workflow.input_schema, payload)
+    return encode_checkpoint(workflow.input_schema, payload)
 
 
-def _encode_checkpoint(schema: type[BaseModel], value: object) -> str:
+def encode_checkpoint(schema: type[BaseModel], value: object) -> str:
     if isinstance(value, schema):
         # Revalidate model instances even if they were mutated or constructed directly.
         value = value.model_dump(mode="python", round_trip=True, by_alias=False)

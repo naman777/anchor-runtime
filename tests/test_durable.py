@@ -1,8 +1,10 @@
 import os
+import sqlite3
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from threading import Barrier
 from uuid import UUID, uuid4
@@ -20,7 +22,17 @@ from anchor_runtime.durable import (
 )
 from anchor_runtime.example import FakeProvider, incident_workflow
 from anchor_runtime.graph import Handler, Node, Workflow
-from anchor_runtime.storage import AttemptState, RunState, StepRecord, StepState
+from anchor_runtime.policy import RetryableError, RetryPolicy
+from anchor_runtime.storage import (
+    AttemptState,
+    OperationState,
+    RunRecord,
+    RunState,
+    StepRecord,
+    StepState,
+)
+from anchor_runtime.tickets import TicketService, ticket_workflow
+from anchor_runtime.tools import ToolConflict
 from anchor_runtime.worker import work_once
 
 pytestmark = pytest.mark.postgres
@@ -270,3 +282,169 @@ def test_failure_blocks_downstream_work(engine, workflow):
         "evidence": StepState.FAILED,
         "assessment": StepState.CANCELLED,
     }
+
+
+def _make_due(engine, record, run_id, **values):
+    identity = record.id if record is RunRecord else record.run_id
+    with engine.begin() as connection:
+        connection.execute(update(record).where(identity == run_id).values(**values))
+
+
+def test_retry_due_time_survives_restart_and_retry_budget_is_bounded(engine, workflow):
+    def transient(context):
+        raise RetryableError("throttled", retry_after=timedelta(seconds=45))
+
+    policy = RetryPolicy(max_attempts=2)
+    workflow = replace(
+        workflow,
+        nodes=(replace(workflow.nodes[0], retry=policy), workflow.nodes[1]),
+        handlers=(
+            replace(workflow.handlers[0], execute=transient),
+            workflow.handlers[1],
+        ),
+    )
+    runtime = DurableRuntime(engine, [workflow], jitter=lambda: 0.5)
+    run_id = runtime.start("incident", "1", PAYLOAD)
+    assert work_once(runtime, "first")
+    history = runtime.inspect(run_id)
+    step = next(step for step in history.steps if step.node_id == "evidence")
+    assert step.state == StepState.RETRY_WAIT
+    assert step.next_attempt_at - history.attempts[0].finished_at == timedelta(
+        seconds=45
+    )
+
+    restarted = DurableRuntime(engine, [workflow])
+    assert not work_once(restarted, "second")
+    _make_due(engine, StepRecord, run_id, next_attempt_at=func.clock_timestamp())
+    assert work_once(restarted, "second")
+    history = restarted.inspect(run_id)
+    assert history.run.state == RunState.FAILED
+    assert [attempt.error_type for attempt in history.attempts] == [
+        "RetryableError",
+        "RetryableError",
+    ]
+
+
+@pytest.mark.parametrize("overall", [False, True])
+def test_deadline_fences_late_completion(engine, workflow, overall):
+    timeout = timedelta(seconds=10)
+    if overall:
+        workflow = replace(workflow, timeout=timeout)
+    else:
+        workflow = replace(
+            workflow,
+            nodes=(replace(workflow.nodes[0], timeout=timeout), workflow.nodes[1]),
+        )
+    runtime = DurableRuntime(engine, [workflow])
+    run_id = runtime.start("incident", "1", PAYLOAD)
+    claim = runtime.claim("worker")
+    _make_due(
+        engine,
+        RunRecord if overall else StepRecord,
+        run_id,
+        deadline=func.clock_timestamp(),
+    )
+    assert not runtime.renew(claim)
+    assert not runtime.succeed(claim, claim.execute())
+    assert runtime.advance_timers()
+    history = runtime.inspect(run_id)
+    assert history.run.state == RunState.FAILED
+    assert history.attempts[0].error_type == (None if overall else "StepTimeout")
+    assert runtime.claim("replacement") is None
+
+
+def test_process_death_after_ticket_creation_reuses_operation_key(engine, tmp_path):
+    ticket_path = tmp_path / "receiver.sqlite"
+    workflow = ticket_workflow(TicketService(ticket_path))
+    runtime = DurableRuntime(engine, [workflow], jitter=lambda: 0)
+    run_id = runtime.start(
+        "ticket-demo", "1", {"service": "checkout", "title": "Elevated errors"}
+    )
+    with engine.connect() as connection:
+        schema = connection.scalar(select(func.current_schema()))
+    child = """
+import os
+from dataclasses import replace
+from sqlalchemy import create_engine
+from anchor_runtime.durable import DurableRuntime
+from anchor_runtime.tickets import TicketService, ticket_workflow
+from anchor_runtime.worker import work_once
+service = TicketService(os.environ["ANCHOR_TICKET_TEST_PATH"])
+def crash_after_effect(key, request):
+    service.create(key, request)
+    os._exit(77)
+workflow = ticket_workflow(service)
+workflow = replace(workflow, tools=(replace(workflow.tools[0], dispatch=crash_after_effect),))
+runtime = DurableRuntime(create_engine(os.environ["ANCHOR_TEST_DATABASE_URL"]), [workflow])
+work_once(runtime, "crashed")
+"""
+    process = subprocess.run(
+        [sys.executable, "-c", child],
+        timeout=20,
+        env={
+            **os.environ,
+            "PGOPTIONS": f"-csearch_path={schema}",
+            "ANCHOR_TICKET_TEST_PATH": str(ticket_path),
+        },
+    )
+    assert process.returncode == 77
+    crashed = runtime.inspect(run_id)
+    assert crashed.operations[0].state == OperationState.DISPATCHING
+    with sqlite3.connect(ticket_path) as connection:
+        original = connection.execute(
+            "SELECT operation_key, ticket_id FROM tickets"
+        ).fetchone()
+
+    _make_due(engine, StepRecord, run_id, lease_expires_at=func.clock_timestamp())
+    assert runtime.advance_timers()
+    assert work_once(runtime, "replacement")
+    completed = runtime.inspect(run_id)
+    assert completed.run.state == RunState.SUCCEEDED
+    assert completed.operations[0].key == original[0]
+    assert completed.steps[0].output == {"id": original[1]}
+    with sqlite3.connect(ticket_path) as connection:
+        assert connection.execute("SELECT count(*) FROM tickets").fetchone() == (1,)
+
+
+def test_uncertain_non_idempotent_write_blocks_retry(engine, tmp_path):
+    count = 0
+
+    def fail_after_dispatch(key, request):
+        nonlocal count
+        count += 1
+        raise RetryableError("connection lost after dispatch")
+
+    workflow = ticket_workflow(TicketService(tmp_path / "receiver.sqlite"))
+    workflow = replace(
+        workflow,
+        tools=(
+            replace(workflow.tools[0], idempotent=False, dispatch=fail_after_dispatch),
+        ),
+    )
+    runtime = DurableRuntime(engine, [workflow])
+    run_id = runtime.start(
+        "ticket-demo", "1", {"service": "checkout", "title": "Elevated errors"}
+    )
+    assert work_once(runtime, "first")
+    assert not work_once(runtime, "second")
+    history = runtime.inspect(run_id)
+    assert count == 1
+    assert history.run.state == RunState.FAILED
+    assert history.attempts[0].error_type == "ReconciliationRequired"
+    assert history.operations[0].state == OperationState.NEEDS_RECONCILIATION
+
+
+def test_tool_operation_id_binds_arguments(engine, tmp_path):
+    workflow = ticket_workflow(TicketService(tmp_path / "receiver.sqlite"))
+    runtime = DurableRuntime(engine, [workflow])
+    payload = {"service": "checkout", "title": "Elevated errors"}
+    runtime.start("ticket-demo", "1", payload)
+    claim = runtime.claim("worker")
+    first = runtime.call_tool(claim, "create_ticket", "incident-ticket", payload)
+    assert (
+        runtime.call_tool(claim, "create_ticket", "incident-ticket", payload) == first
+    )
+    with pytest.raises(ToolConflict):
+        runtime.call_tool(
+            claim, "create_ticket", "incident-ticket", {**payload, "title": "Different"}
+        )

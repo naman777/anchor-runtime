@@ -20,6 +20,7 @@ class StepState(StrEnum):
     PENDING = "PENDING"
     READY = "READY"
     RUNNING = "RUNNING"
+    RETRY_WAIT = "RETRY_WAIT"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
@@ -31,6 +32,12 @@ class AttemptState(StrEnum):
     FAILED = "FAILED"
     LEASE_EXPIRED = "LEASE_EXPIRED"
     CANCELLED = "CANCELLED"
+
+
+class OperationState(StrEnum):
+    DISPATCHING = "DISPATCHING"
+    SUCCEEDED = "SUCCEEDED"
+    NEEDS_RECONCILIATION = "NEEDS_RECONCILIATION"
 
 
 class Base(DeclarativeBase):
@@ -72,6 +79,7 @@ class RunRecord(Base):
     request_digest: Mapped[str]
     event_sequence: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class StepRecord(Base):
@@ -83,12 +91,20 @@ class StepRecord(Base):
     run_id: Mapped[UUID] = mapped_column(ForeignKey("runs.id"), primary_key=True)
     node_id: Mapped[str] = mapped_column(primary_key=True)
     state: Mapped[StepState] = mapped_column(
-        Enum(StepState, native_enum=False, create_constraint=True, name="step_state")
+        Enum(
+            StepState,
+            native_enum=False,
+            create_constraint=True,
+            name="step_state",
+            length=32,
+        )
     )
     output: Mapped[Any] = mapped_column(JSONB(none_as_null=True), nullable=True)
     attempt_number: Mapped[int] = mapped_column(default=0)
     lease_owner: Mapped[str | None]
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AttemptRecord(Base):
@@ -123,3 +139,28 @@ class EventRecord(Base):
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     node_id: Mapped[str | None]
     attempt_number: Mapped[int | None]
+
+
+class ToolOperation(Base):
+    __tablename__ = "tool_operations"
+    __table_args__ = (
+        ForeignKeyConstraint(["run_id", "node_id"], ["steps.run_id", "steps.node_id"]),
+    )
+
+    run_id: Mapped[UUID] = mapped_column(primary_key=True)
+    node_id: Mapped[str] = mapped_column(primary_key=True)
+    operation_id: Mapped[str] = mapped_column(primary_key=True)
+    key: Mapped[str] = mapped_column(unique=True)
+    tool_name: Mapped[str]
+    idempotent: Mapped[bool]
+    action_digest: Mapped[str]
+    arguments: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    state: Mapped[OperationState] = mapped_column(
+        Enum(
+            OperationState,
+            native_enum=False,
+            create_constraint=True,
+            name="operation_state",
+        )
+    )
+    result: Mapped[Any] = mapped_column(JSONB(none_as_null=True), nullable=True)

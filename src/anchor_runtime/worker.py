@@ -1,11 +1,13 @@
 """Synchronous handlers run outside transactions with a lease heartbeat."""
 
 import logging
+from datetime import timedelta
 from threading import Event, Thread
 
 from sqlalchemy.exc import OperationalError
 
 from anchor_runtime.durable import Claim, DurableRuntime
+from anchor_runtime.policy import RetryableError
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +36,17 @@ def work_once(runtime: DurableRuntime, owner: str) -> bool:
     heartbeat.start()
     try:
         try:
-            output = claim.execute()
+            output = runtime.execute(claim)
+        except OperationalError:
+            raise
         except Exception as error:
-            accepted = runtime.fail(claim, type(error).__name__)
+            transient = isinstance(error, RetryableError)
+            accepted = runtime.fail(
+                claim,
+                type(error).__name__,
+                retryable=transient,
+                retry_after=error.retry_after if transient else timedelta(0),
+            )
         else:
             accepted = runtime.succeed(claim, output)
         if not accepted:
