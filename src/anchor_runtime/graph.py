@@ -15,6 +15,12 @@ from anchor_runtime.tools import Tool, ToolCaller
 Model = TypeVar("Model", bound=BaseModel)
 
 
+class Route(BaseModel):
+    """The route selected by a condition handler."""
+
+    selected: str
+
+
 @dataclass(frozen=True, slots=True)
 class StepContext:
     run_input: BaseModel
@@ -66,10 +72,17 @@ class Node:
     retry: RetryPolicy | None = None
     timeout: timedelta | None = None
     tools: tuple[str, ...] = ()
+    routes: tuple[str, ...] = ()
+    when: tuple[tuple[str, str], ...] = ()
+    join_selected: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "parents", tuple(self.parents))
         object.__setattr__(self, "tools", tuple(self.tools))
+        object.__setattr__(self, "routes", tuple(self.routes))
+        object.__setattr__(
+            self, "when", tuple((parent, route) for parent, route in self.when)
+        )
         if not all((self.id, self.handler, self.handler_version)):
             raise ValueError("Node ID, handler name, and handler version are required")
         if len(set(self.parents)) != len(self.parents):
@@ -78,6 +91,14 @@ class Node:
             raise ValueError("Step timeout must be positive")
         if len(set(self.tools)) != len(self.tools):
             raise ValueError(f"Duplicate tool on node {self.id!r}")
+        if len(set(self.routes)) != len(self.routes) or not all(self.routes):
+            raise ValueError(
+                f"Routes must be unique nonempty names on node {self.id!r}"
+            )
+        if len(dict(self.when)) != len(self.when):
+            raise ValueError(
+                f"Only one route can be required per dependency on node {self.id!r}"
+            )
 
     @property
     def handler_key(self) -> tuple[str, str]:
@@ -134,6 +155,15 @@ class Workflow:
                 raise ValueError(
                     f"Unknown tools for {node_id!r}: {sorted(unknown_tools)}"
                 )
+            if node.routes and not issubclass(
+                handlers[node.handler_key].output_schema, Route
+            ):
+                raise ValueError(f"Condition {node_id!r} must return a Route model")
+            for parent, route in node.when:
+                if parent not in node.parents or route not in nodes[parent].routes:
+                    raise ValueError(
+                        f"Invalid route {route!r} from dependency {parent!r} on {node_id!r}"
+                    )
             dependencies[node_id] = node.parents
 
         try:

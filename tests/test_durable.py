@@ -23,8 +23,9 @@ from anchor_runtime.durable import (
     VersionConflict,
 )
 from anchor_runtime.example import FakeProvider, incident_workflow
-from anchor_runtime.graph import Handler, Node, Workflow
+from anchor_runtime.graph import Handler, Node, Route, Workflow
 from anchor_runtime.policy import RetryableError, RetryPolicy
+from anchor_runtime.runner import run
 from anchor_runtime.storage import (
     ApprovalRecord,
     ApprovalState,
@@ -630,3 +631,112 @@ def test_cancel_running_step_rejects_late_result_and_downstream_work(engine, wor
     history = runtime.inspect(run_id)
     assert history.attempts[0].state == AttemptState.CANCELLED
     assert all(step.state == StepState.CANCELLED for step in history.steps)
+
+
+@pytest.mark.parametrize("route", ["left", "right"])
+def test_branch_selection_skips_unreachable_steps_and_joins_once(
+    engine, workflow, route
+):
+    evidence = workflow.handlers[0]
+
+    def join(context):
+        assert tuple(context.parents) == (route,)
+        return context.parents[route]
+
+    branch = Workflow(
+        "conditional",
+        "1",
+        workflow.input_schema,
+        (
+            Node("route", "choose", "1", routes=("left", "right", "unused")),
+            Node("left", "collect", "1", ("route",), when=(("route", "left"),)),
+            Node("right", "collect", "1", ("route",), when=(("route", "right"),)),
+            Node("left-follow-up", "collect", "1", ("left",)),
+            Node("join", "join", "1", ("right", "left"), join_selected=True),
+            Node(
+                "no-selected-parent",
+                "collect",
+                "1",
+                ("route",),
+                when=(("route", "unused"),),
+                join_selected=True,
+            ),
+        ),
+        (
+            evidence,
+            Handler("choose", "1", Route, lambda _: Route(selected=route)),
+            Handler("join", "1", evidence.output_schema, join),
+        ),
+    )
+    runtime = DurableRuntime(engine, [branch])
+    run_id = runtime.start("conditional", "1", PAYLOAD)
+    while work_once(runtime, "worker"):
+        pass
+    history = runtime.inspect(run_id)
+    reference = run(branch, PAYLOAD)
+    assert history.run.state == RunState.SUCCEEDED
+    assert {
+        step.node_id for step in history.steps if step.state == StepState.SUCCEEDED
+    } == reference.outputs.keys()
+    assert {
+        step.node_id for step in history.steps if step.state == StepState.SKIPPED
+    } == (
+        {"right", "no-selected-parent"}
+        if route == "left"
+        else {"left", "left-follow-up", "no-selected-parent"}
+    )
+    assert sum(attempt.node_id == "join" for attempt in history.attempts) == 1
+
+
+def test_branch_retry_reuses_committed_sibling(engine, workflow):
+    attempts = 0
+    evidence = workflow.handlers[0]
+
+    def retryable(context):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RetryableError("temporary")
+        return evidence.execute(context)
+
+    def join(context):
+        assert tuple(context.parents) == ("b-retry", "a-complete")
+        return context.parents["b-retry"]
+
+    branch = Workflow(
+        "retry-branch",
+        "1",
+        workflow.input_schema,
+        (
+            Node("a-complete", "collect", "1"),
+            Node("b-retry", "retry", "1", retry=RetryPolicy(max_attempts=2)),
+            Node("join", "join", "1", ("b-retry", "a-complete")),
+        ),
+        (
+            evidence,
+            Handler("retry", "1", evidence.output_schema, retryable),
+            Handler("join", "1", evidence.output_schema, join),
+        ),
+    )
+    runtime = DurableRuntime(engine, [branch], jitter=lambda: 1)
+    run_id = runtime.start("retry-branch", "1", PAYLOAD)
+    assert work_once(runtime, "first")
+    assert work_once(runtime, "first")
+    retrying = runtime.inspect(run_id)
+    step = next(step for step in retrying.steps if step.node_id == "b-retry")
+    attempt = next(
+        attempt for attempt in retrying.attempts if attempt.node_id == "b-retry"
+    )
+    assert step.next_attempt_at - attempt.finished_at == timedelta(seconds=1)
+    _make_due(engine, StepRecord, run_id, next_attempt_at=func.clock_timestamp())
+    restarted = DurableRuntime(engine, [branch])
+    assert work_once(restarted, "replacement")
+    assert work_once(restarted, "replacement")
+    history = restarted.inspect(run_id)
+    assert history.run.state == RunState.SUCCEEDED
+    assert [attempt.node_id for attempt in history.attempts] == [
+        "a-complete",
+        "b-retry",
+        "b-retry",
+        "join",
+    ]

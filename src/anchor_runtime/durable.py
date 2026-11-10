@@ -13,6 +13,7 @@ from sqlalchemy import Engine, and_, func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, sessionmaker
 
+from anchor_runtime.branches import Readiness, select_parents, selected_route
 from anchor_runtime.graph import Workflow
 from anchor_runtime.runner import encode_checkpoint, encode_input, execute_node
 from anchor_runtime.storage import (
@@ -122,6 +123,12 @@ def _definition(workflow: Workflow) -> dict:
                 "base_delay": node.retry.base_delay.total_seconds(),
                 "max_delay": node.retry.max_delay.total_seconds(),
             }
+        if node.routes:
+            entry["routes"] = sorted(node.routes)
+        if node.when:
+            entry["when"] = dict(node.when)
+        if node.join_selected:
+            entry["join_selected"] = True
         if node.tools:
             entry["tools"] = [
                 {
@@ -175,6 +182,16 @@ def _clear_lease(step: StepRecord) -> None:
     step.lease_owner = None
     step.lease_expires_at = None
     step.deadline = None
+
+
+def _completed_routes(
+    workflow: Workflow, steps: dict[str, StepRecord]
+) -> dict[str, str | None]:
+    return {
+        node_id: selected_route(workflow.nodes_by_id[node_id], step.output)
+        for node_id, step in steps.items()
+        if step.state == StepState.SUCCEEDED
+    }
 
 
 class DurableRuntime:
@@ -326,9 +343,25 @@ class DurableRuntime:
                 )
             )
             _event(session, run, "step.started", now, step, step.attempt_number)
+            parents = {
+                parent: session.get(StepRecord, (run.id, parent))
+                for parent in node.parents
+            }
+            readiness, selected = select_parents(
+                node,
+                _completed_routes(workflow, parents),
+                {
+                    parent
+                    for parent, record in parents.items()
+                    if record.state == StepState.SKIPPED
+                },
+            )
+            if readiness != Readiness.READY:
+                raise RuntimeError(
+                    f"Ready step {step.node_id!r} has unsatisfied dependencies"
+                )
             parent_outputs = tuple(
-                (parent, _json(session.get(StepRecord, (run.id, parent)).output))
-                for parent in workflow.nodes_by_id[step.node_id].parents
+                (parent, _json(parents[parent].output)) for parent in selected
             )
             return Claim(
                 run.id,
@@ -737,6 +770,7 @@ class DurableRuntime:
         ]
         handler.output_schema.model_validate_json(output, by_name=True)
         checkpoint = json.loads(output)
+        selected_route(workflow.nodes_by_id[claim.node_id], checkpoint)
         with self._sessions.begin() as session:
             current = self._lock_claim(session, claim)
             if current is None:
@@ -754,7 +788,10 @@ class DurableRuntime:
             _event(session, run, "step.succeeded", now, step, claim.number)
             steps = self._steps(session, run.id)
             self._schedule(session, workflow, run, steps, now)
-            if all(step.state == StepState.SUCCEEDED for step in steps.values()):
+            if all(
+                step.state in {StepState.SUCCEEDED, StepState.SKIPPED}
+                for step in steps.values()
+            ):
                 run.state = RunState.SUCCEEDED
                 _event(session, run, "run.succeeded", now)
             return True
@@ -861,7 +898,7 @@ class DurableRuntime:
             step = session.get(StepRecord, (run.id, approval.node_id))
             _event(session, run, "approval.cancelled", now, step, step.attempt_number)
         for step in self._steps(session, run.id).values():
-            if step.state in {StepState.SUCCEEDED, StepState.FAILED}:
+            if step.state in {StepState.SUCCEEDED, StepState.SKIPPED, StepState.FAILED}:
                 continue
             number = None
             if step.state == StepState.RUNNING:
@@ -934,13 +971,25 @@ class DurableRuntime:
         steps: dict[str, StepRecord],
         now: datetime,
     ) -> None:
+        completed = _completed_routes(workflow, steps)
+        skipped = {
+            node_id
+            for node_id, step in steps.items()
+            if step.state == StepState.SKIPPED
+        }
         for node_id in workflow.order:
             step = steps[node_id]
-            if step.state == StepState.PENDING and all(
-                steps[parent].state == StepState.SUCCEEDED
-                for parent in workflow.nodes_by_id[node_id].parents
-            ):
+            if step.state != StepState.PENDING:
+                continue
+            readiness, _ = select_parents(
+                workflow.nodes_by_id[node_id], completed, skipped
+            )
+            if readiness == Readiness.READY:
                 DurableRuntime._make_ready(session, run, step, now)
+            elif readiness == Readiness.SKIP:
+                step.state = StepState.SKIPPED
+                skipped.add(node_id)
+                _event(session, run, "step.skipped", now, step)
 
     def inspect(self, run_id: UUID) -> RunHistory | None:
         with self._sessions.begin() as session:

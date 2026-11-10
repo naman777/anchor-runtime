@@ -76,6 +76,19 @@ Each test applies the migrations in its own temporary schema.
   external writes that can repeat. An ambiguous write without deduplication
   support is recorded as `NEEDS_RECONCILIATION` and requires manual review.
 
+## Conditional workflows
+
+A condition node declares its allowed `routes`. Its handler returns a
+`Route(selected="…")` model. A downstream node can add
+`when=(("condition_node", "selected_route"),)` to require that route on a
+direct dependency. The runtime records unselected nodes and their blocked
+descendants as `SKIPPED`.
+
+An ordinary join requires every parent to succeed. A join with
+`join_selected=True` waits for every parent to either succeed or be skipped,
+then receives the selected parent outputs in the order declared in `parents`.
+If every input is skipped, the join is skipped too.
+
 ## Ticket recovery demo
 
 Set `ANCHOR_TICKET_DB` to a writable SQLite file path and apply the migrations.
