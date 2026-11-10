@@ -1,8 +1,8 @@
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from anchor_runtime.example import Assessment, FakeProvider, incident_workflow
-from anchor_runtime.graph import Node, Workflow
+from anchor_runtime.graph import Handler, Node, Workflow
 from anchor_runtime.runner import Event, run
 
 
@@ -52,3 +52,23 @@ def test_rejects_invalid_handler_output():
 
     with pytest.raises(ValidationError):
         run(incident_workflow(InvalidProvider()), {"service": "checkout", "error_rate": 0.1})
+
+
+def test_checkpoints_use_field_names_when_validation_and_serialization_aliases_differ():
+    class Input(BaseModel):
+        service: str = Field(validation_alias="from_user", serialization_alias="for_display")
+
+    def collect(context):
+        return context.input_as(Input)
+
+    def summarize(context):
+        return context.parent_as("collect", Input)
+
+    workflow = Workflow(
+        "aliases",
+        "1",
+        Input,
+        (Node("collect", "collect", "1"), Node("summary", "summarize", "1", ("collect",))),
+        (Handler("collect", "1", Input, collect), Handler("summarize", "1", Input, summarize)),
+    )
+    assert run(workflow, {"from_user": "checkout"}).outputs["summary"] == '{"service":"checkout"}'
