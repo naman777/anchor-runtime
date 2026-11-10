@@ -1,0 +1,54 @@
+import pytest
+from pydantic import ValidationError
+
+from anchor_runtime.example import Assessment, FakeProvider, incident_workflow
+from anchor_runtime.graph import Node, Workflow
+from anchor_runtime.runner import Event, run
+
+
+@pytest.mark.parametrize(
+    ("nodes", "message"),
+    [
+        ((Node("a", "collect", "2"),), "Missing handler"),
+        ((Node("a", "collect", "1", ("b",)),), "Unknown dependencies"),
+        ((Node("a", "collect", "1"), Node("a", "collect", "1")), "Duplicate node"),
+        ((Node("a", "collect", "1", ("a",)),), "cycle"),
+        (
+            (Node("a", "collect", "1", ("b",)), Node("b", "collect", "1", ("a",))),
+            "cycle",
+        ),
+    ],
+)
+def test_rejects_invalid_graph(nodes, message):
+    sample = incident_workflow(FakeProvider())
+    with pytest.raises(ValueError, match=message):
+        Workflow("invalid", "1", sample.input_schema, nodes, sample.handlers)
+
+
+def test_runs_typed_workflow_in_dependency_order():
+    result = run(incident_workflow(FakeProvider()), {"service": "checkout", "error_rate": 0.1})
+    assert Assessment.model_validate_json(result.outputs["assessment"]) == Assessment(
+        service="checkout", severity="elevated"
+    )
+    assert result.events == (
+        Event("run.started"),
+        Event("step.started", "evidence"),
+        Event("step.succeeded", "evidence"),
+        Event("step.started", "assessment"),
+        Event("step.succeeded", "assessment"),
+        Event("run.succeeded"),
+    )
+
+
+def test_rejects_invalid_input():
+    with pytest.raises(ValidationError):
+        run(incident_workflow(FakeProvider()), {"service": "checkout", "error_rate": 2})
+
+
+def test_rejects_invalid_handler_output():
+    class InvalidProvider:
+        def assess(self, evidence):
+            return Assessment.model_construct(service=evidence.service, severity="critical")
+
+    with pytest.raises(ValidationError):
+        run(incident_workflow(InvalidProvider()), {"service": "checkout", "error_rate": 0.1})
