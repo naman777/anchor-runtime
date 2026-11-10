@@ -2,7 +2,8 @@
 
 Anchor is a Python workflow engine for running agent work across process
 failures and human decisions. See the [implementation plan](durable_agent_engine_plan.md)
-for the target architecture and evaluation.
+for the target architecture and evaluation, and [development progress](PROGRESS.md)
+for completed milestones and remaining work.
 
 The SDK validates versioned DAGs, workflow inputs, and handler outputs. Each
 handler receives its direct parents' outputs in the declared dependency order.
