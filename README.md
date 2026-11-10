@@ -171,3 +171,21 @@ was lost. Each investigator has a four-round limit and the run reserves at
 most 12 dispatches across both investigators. Requests also have input size
 and output token limits. Token counts reflect usage reported and recorded
 by the provider. An interrupted dispatch may incur unobserved usage.
+
+## Run console and traces
+
+With the API running, open `http://127.0.0.1:8000/console`. Use an operator
+token and run ID to view the graph, checkpoints, attempts, approvals, tool
+operations, model usage, and ordered events. Use a reviewer token to inspect
+the pending action's exact arguments and approve or reject it. The page uses
+the same authenticated endpoints as the API.
+
+Runs started through the API carry the trace context into worker attempts.
+Worker logs include the run, node, attempt, and trace IDs. To export spans,
+set `ANCHOR_OTLP_TRACES_ENDPOINT` in the API and workers to your collector's
+OTLP HTTP traces endpoint, including its `/v1/traces` path.
+
+The inspector omits raw model prompts and responses and redacts known
+credential fields in checkpoints. Approval arguments remain visible to
+authorized reviewers so they can verify the exact action. Keep credentials
+out of action payloads and free-form text.

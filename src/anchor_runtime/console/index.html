@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Anchor Runtime Console</title>
+  <link rel="stylesheet" href="/console.css">
+  <script src="/console.js" defer></script>
+</head>
+<body>
+  <header>
+    <p class="label">Anchor Runtime</p>
+    <h1>Execution console</h1>
+    <p>Inspect workflow runs and review proposed tool actions.</p>
+    <nav aria-label="Console sections">
+      <a href="#runs">Run inspection</a>
+      <a href="#approvals">Approval inbox</a>
+    </nav>
+  </header>
+  <main>
+    <section id="runs" aria-labelledby="runs-title">
+      <h2 id="runs-title">Run inspection</h2>
+      <form id="inspect-form" autocomplete="off">
+        <label>Operator token <input id="operator-token" type="password" required></label>
+        <label>Run ID <input id="run-id" type="text" required spellcheck="false"></label>
+        <button>Load run</button>
+      </form>
+      <p id="run-status" role="status" aria-live="polite"></p>
+      <div id="run-detail"></div>
+    </section>
+    <section id="approvals" aria-labelledby="approvals-title">
+      <h2 id="approvals-title">Approval inbox</h2>
+      <form id="inbox-form" autocomplete="off">
+        <label>Reviewer token <input id="reviewer-token" type="password" required></label>
+        <button>Load pending actions</button>
+      </form>
+      <p id="inbox-status" role="status" aria-live="polite"></p>
+      <div id="approval-list"></div>
+    </section>
+  </main>
+</body>
+</html>

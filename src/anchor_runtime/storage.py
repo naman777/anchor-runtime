@@ -97,6 +97,7 @@ class RunRecord(Base):
     request_digest: Mapped[str]
     event_sequence: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    traceparent: Mapped[str | None]
     deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
@@ -147,6 +148,7 @@ class AttemptRecord(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_type: Mapped[str | None]
+    traceparent: Mapped[str | None]
 
 
 class EventRecord(Base):
@@ -158,6 +160,7 @@ class EventRecord(Base):
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     node_id: Mapped[str | None]
     attempt_number: Mapped[int | None]
+    subject: Mapped[str | None]
 
 
 class ToolOperation(Base):

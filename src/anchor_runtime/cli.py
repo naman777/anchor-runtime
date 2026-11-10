@@ -12,6 +12,7 @@ from sqlalchemy.exc import OperationalError
 
 from anchor_runtime.durable import DurableRuntime
 from anchor_runtime.example import demo_workflows
+from anchor_runtime.inspection import redact
 from anchor_runtime.worker import work_once
 
 
@@ -47,7 +48,7 @@ def main() -> None:
     ticket_db = os.environ.get("ANCHOR_TICKET_DB")
     if args.command in {"start-ticket", "start-investigation"} and not ticket_db:
         parser.error("Set ANCHOR_TICKET_DB to the mock receiver's SQLite file")
-    engine = create_engine(url, pool_pre_ping=True)
+    engine = create_engine(url, pool_pre_ping=True, hide_parameters=True)
     try:
         runtime = DurableRuntime(engine, demo_workflows(ticket_db))
         if args.command == "start":
@@ -86,7 +87,7 @@ def main() -> None:
                     event.node_id or "",
                 )
             for step in history.steps:
-                print(step.node_id, step.state, step.output)
+                print(step.node_id, step.state, redact(step.output))
             for operation in history.operations:
                 print(operation.node_id, operation.operation_id, operation.state)
             for approval in history.approvals:

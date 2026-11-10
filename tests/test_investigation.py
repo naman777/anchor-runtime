@@ -9,6 +9,7 @@ from sqlalchemy import func, update
 
 from anchor_runtime.durable import DurableRuntime
 from anchor_runtime.fake_model import FakeInvestigator
+from anchor_runtime.inspection import run_view
 from anchor_runtime.investigation import investigation_workflow
 from anchor_runtime.models import ModelLimitExceeded, ModelResponse
 from anchor_runtime.policy import RetryableError
@@ -153,6 +154,12 @@ def test_retry_reuses_completed_model_and_tool_rounds(engine, tmp_path):
     assert attempted.count(("runbook",)) == 2
     assert [call.dispatch_count for call in completed.model_calls] == [1, 2, 1]
     assert sum(call.input_tokens for call in completed.model_calls) == 33
+    assert run_view(completed)["usage"] == {
+        "reported_input_tokens": 33,
+        "reported_output_tokens": 15,
+        "dispatches": 4,
+        "uncheckpointed_dispatches": 1,
+    }
     assert (
         sum(
             event.type == "tool.dispatching" and event.node_id == "changes"

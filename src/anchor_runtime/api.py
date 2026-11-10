@@ -3,21 +3,26 @@
 import json
 import os
 from datetime import datetime
+from pathlib import Path
 from secrets import compare_digest
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import create_engine
 
 from anchor_runtime.durable import ApprovalConflict, DurableRuntime, RequestConflict
 from anchor_runtime.example import demo_workflows
+from anchor_runtime.inspection import run_view
 from anchor_runtime.storage import ApprovalState, RunState
+from anchor_runtime.telemetry import span, tag_run
 
 bearer = HTTPBearer()
 Credentials = Annotated[HTTPAuthorizationCredentials, Depends(bearer)]
+CONSOLE = Path(__file__).with_name("console")
 
 
 class StartRequest(BaseModel):
@@ -66,6 +71,39 @@ def create_app(
         )
     app = FastAPI(title="Anchor Runtime")
 
+    @app.middleware("http")
+    async def trace_request(request: Request, call_next):
+        with span(
+            "anchor.http", attributes={"http.request.method": request.method}
+        ) as request_span:
+            response = await call_next(request)
+            route = getattr(request.scope.get("route"), "path", None)
+            if route:
+                request_span.set_attribute("http.route", route)
+            request_span.set_attribute(
+                "http.response.status_code", response.status_code
+            )
+            response.headers["Cache-Control"] = "no-store"
+            return response
+
+    @app.get("/console", include_in_schema=False)
+    def console():
+        return FileResponse(
+            CONSOLE / "index.html",
+            headers={
+                "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+                "Referrer-Policy": "no-referrer",
+            },
+        )
+
+    @app.get("/console.js", include_in_schema=False)
+    def console_script():
+        return FileResponse(CONSOLE / "console.js", media_type="text/javascript")
+
+    @app.get("/console.css", include_in_schema=False)
+    def console_style():
+        return FileResponse(CONSOLE / "console.css", media_type="text/css")
+
     def operator(credentials: Credentials) -> None:
         if not compare_digest(credentials.credentials.encode(), operator_secret):
             raise HTTPException(403, "Operator credentials required")
@@ -102,6 +140,7 @@ def create_app(
             ) from error
         except RequestConflict as error:
             raise HTTPException(409, str(error)) from error
+        tag_run(run_id)
         return {"id": run_id}
 
     @app.get("/runs/{run_id}", dependencies=[Depends(operator)])
@@ -109,54 +148,15 @@ def create_app(
         history = runtime.inspect(run_id)
         if history is None:
             raise HTTPException(404, "Run not found")
-        return {
-            "id": history.run.id,
-            "state": history.run.state,
-            "workflow": history.run.workflow_name,
-            "version": history.run.workflow_version,
-            "steps": [
-                {"id": step.node_id, "state": step.state, "output": step.output}
-                for step in history.steps
-            ],
-            "events": [
-                {
-                    "sequence": event.sequence,
-                    "type": event.type,
-                    "at": event.at,
-                    "node_id": event.node_id,
-                    "attempt": event.attempt_number,
-                }
-                for event in history.events
-            ],
-            "operations": [
-                {
-                    "node_id": operation.node_id,
-                    "id": operation.operation_id,
-                    "state": operation.state,
-                }
-                for operation in history.operations
-            ],
-            "model_calls": [
-                {
-                    "node_id": call.node_id,
-                    "round": call.round_number,
-                    "provider": call.provider,
-                    "model": call.model,
-                    "prompt_version": call.prompt_version,
-                    "state": call.state,
-                    "dispatches": call.dispatch_count,
-                    "input_tokens": call.input_tokens,
-                    "output_tokens": call.output_tokens,
-                }
-                for call in history.model_calls
-            ],
-        }
+        tag_run(run_id)
+        return run_view(history)
 
     @app.post("/runs/{run_id}/cancel", dependencies=[Depends(operator)])
     def cancel(run_id: UUID):
         state = runtime.cancel(run_id)
         if state is None:
             raise HTTPException(404, "Run not found")
+        tag_run(run_id)
         if state != RunState.CANCELLED:
             raise HTTPException(409, f"Run is already {state.value.lower()}")
         return {"id": run_id, "state": state}
@@ -187,6 +187,7 @@ def create_app(
             raise HTTPException(409, str(error)) from error
         if approval is None:
             raise HTTPException(404, "Approval not found")
+        tag_run(approval.run_id)
         if approval.state in {ApprovalState.EXPIRED, ApprovalState.CANCELLED}:
             raise HTTPException(409, f"Approval is {approval.state.value.lower()}")
         return approval
@@ -195,7 +196,9 @@ def create_app(
 
 
 def app_from_env() -> FastAPI:
-    engine = create_engine(os.environ["ANCHOR_DATABASE_URL"], pool_pre_ping=True)
+    engine = create_engine(
+        os.environ["ANCHOR_DATABASE_URL"], pool_pre_ping=True, hide_parameters=True
+    )
     runtime = DurableRuntime(engine, demo_workflows(os.environ.get("ANCHOR_TICKET_DB")))
     return create_app(
         runtime,

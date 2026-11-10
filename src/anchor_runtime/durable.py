@@ -40,6 +40,7 @@ from anchor_runtime.storage import (
     ToolOperation,
     WorkflowVersion,
 )
+from anchor_runtime.telemetry import current_traceparent, span
 from anchor_runtime.tools import (
     ApprovalWait,
     LeaseLost,
@@ -71,6 +72,7 @@ class Claim:
     workflow: Workflow
     run_input: str
     parent_outputs: tuple[tuple[str, str], ...]
+    traceparent: str | None = None
 
     def execute(
         self,
@@ -98,6 +100,7 @@ class RunHistory:
     operations: tuple[ToolOperation, ...]
     approvals: tuple[ApprovalRecord, ...]
     model_calls: tuple[ModelCallRecord, ...]
+    graph: tuple[dict, ...]
 
 
 def _json(value: object) -> str:
@@ -191,6 +194,8 @@ def _event(
     now: datetime,
     step: StepRecord | None = None,
     attempt: int | None = None,
+    *,
+    subject: str | None = None,
 ) -> None:
     run.event_sequence += 1
     session.add(
@@ -201,6 +206,7 @@ def _event(
             at=now,
             node_id=step.node_id if step is not None else None,
             attempt_number=attempt,
+            subject=subject,
         )
     )
 
@@ -290,6 +296,7 @@ class DurableRuntime:
                     idempotency_key=idempotency_key,
                     request_digest=request_digest,
                     created_at=now,
+                    traceparent=current_traceparent(),
                     deadline=now + workflow.timeout if workflow.timeout else None,
                 )
                 .on_conflict_do_nothing(index_elements=[RunRecord.idempotency_key])
@@ -398,6 +405,7 @@ class DurableRuntime:
                 workflow,
                 _json(run.input),
                 parent_outputs,
+                run.traceparent,
             )
 
     @staticmethod
@@ -526,6 +534,16 @@ class DurableRuntime:
             step.lease_expires_at = now + self.lease
             return True
 
+    def attach_trace(self, claim: Claim, traceparent: str) -> bool:
+        with self._sessions.begin() as session:
+            if self._lock_claim(session, claim) is None:
+                return False
+            attempt = session.get(
+                AttemptRecord, (claim.run_id, claim.node_id, claim.number)
+            )
+            attempt.traceparent = traceparent
+            return True
+
     def execute(self, claim: Claim) -> str:
         return claim.execute(
             lambda name, operation_id, arguments: self.call_tool(
@@ -566,15 +584,19 @@ class DurableRuntime:
                 _json(cached.response), by_name=True
             )
 
-        response = agent.provider.complete(
-            ModelRequest(
-                agent.model,
-                agent.instructions,
-                canonical_payload,
-                agent.response_schema,
-                agent.max_output_tokens,
+        with span(
+            "anchor.model",
+            attributes={"anchor.model": agent.model, "anchor.round": round_number},
+        ):
+            response = agent.provider.complete(
+                ModelRequest(
+                    agent.model,
+                    agent.instructions,
+                    canonical_payload,
+                    agent.response_schema,
+                    agent.max_output_tokens,
+                )
             )
-        )
         try:
             checkpoint = encode_checkpoint(agent.response_schema, response.output)
         except (ValueError, TypeError):
@@ -606,6 +628,7 @@ class DurableRuntime:
                 now,
                 step,
                 claim.number,
+                subject=f"round:{round_number}",
             )
         if checkpoint is None:
             raise ModelOutputRejected(
@@ -671,7 +694,15 @@ class DurableRuntime:
                 session.add(call)
             call.dispatch_count += 1
             call.last_attempt = claim.number
-            _event(session, run, "model.dispatching", now, step, claim.number)
+            _event(
+                session,
+                run,
+                "model.dispatching",
+                now,
+                step,
+                claim.number,
+                subject=f"round:{round_number}",
+            )
             return None
 
     def _require_approval(
@@ -694,12 +725,13 @@ class DurableRuntime:
                 if approval.state != ApprovalState.APPROVED:
                     raise ApprovalConflict("Protected action has no valid approval")
                 return
+            approval_id = uuid4()
             session.add(
                 ApprovalRecord(
                     run_id=run.id,
                     node_id=step.node_id,
                     operation_id=operation_id,
-                    id=uuid4(),
+                    id=approval_id,
                     tool_name=tool.name,
                     destination=tool.destination,
                     action_digest=digest,
@@ -713,7 +745,15 @@ class DurableRuntime:
             attempt = session.get(AttemptRecord, (run.id, step.node_id, claim.number))
             attempt.state = AttemptState.WAITING_APPROVAL
             attempt.finished_at = now
-            _event(session, run, "approval.requested", now, step, claim.number)
+            _event(
+                session,
+                run,
+                "approval.requested",
+                now,
+                step,
+                claim.number,
+                subject=str(approval_id),
+            )
         raise ApprovalWait("The protected action is waiting for approval")
 
     def pending_approvals(self, *, limit: int = 100) -> tuple[ApprovalRecord, ...]:
@@ -804,6 +844,7 @@ class DurableRuntime:
             now,
             step,
             step.attempt_number,
+            subject=str(approval.id),
         )
         if decision == ApprovalState.APPROVED:
             self._make_ready(session, run, step, now)
@@ -829,16 +870,24 @@ class DurableRuntime:
     ) -> object:
         workflow = self.workflows[claim.workflow.name, claim.workflow.version]
         node = workflow.nodes_by_id[claim.node_id]
+        if not operation_id or len(operation_id) > 200:
+            raise ValueError("Operation ID must contain 1 to 200 characters")
         if name not in node.tools:
             with self._sessions.begin() as session:
                 current = self._lock_claim(session, claim)
                 if current is None:
                     raise LeaseLost("Cannot request a tool without a current lease")
                 run, step, now = current
-                _event(session, run, "tool.denied", now, step, claim.number)
+                _event(
+                    session,
+                    run,
+                    "tool.denied",
+                    now,
+                    step,
+                    claim.number,
+                    subject=operation_id,
+                )
             raise PermissionError(f"Tool {name!r} is not allowed for this step")
-        if not operation_id or len(operation_id) > 200:
-            raise ValueError("Operation ID must contain 1 to 200 characters")
         tool = workflow.tools_by_name[name]
         encoded = encode_checkpoint(tool.input_schema, arguments)
         payload = json.loads(encoded)
@@ -896,14 +945,26 @@ class DurableRuntime:
                         session, run, step, now
                     )
             if not needs_reconciliation:
-                _event(session, run, "tool.dispatching", now, step, claim.number)
+                _event(
+                    session,
+                    run,
+                    "tool.dispatching",
+                    now,
+                    step,
+                    claim.number,
+                    subject=operation_id,
+                )
         if needs_reconciliation:
             raise ReconciliationRequired(
                 "Check the external system before repeating this operation"
             )
 
         try:
-            result = json.loads(_json(tool.dispatch(key, validated)))
+            with span(
+                "anchor.tool",
+                attributes={"anchor.tool": tool.name, "anchor.operation": operation_id},
+            ):
+                result = json.loads(_json(tool.dispatch(key, validated)))
         except Exception as error:
             if tool.idempotent:
                 raise
@@ -929,7 +990,15 @@ class DurableRuntime:
                 return operation.result
             operation.result = result
             operation.state = OperationState.SUCCEEDED
-            _event(session, run, "tool.succeeded", now, step, claim.number)
+            _event(
+                session,
+                run,
+                "tool.succeeded",
+                now,
+                step,
+                claim.number,
+                subject=operation_id,
+            )
             return result
 
     def succeed(self, claim: Claim, output: str) -> bool:
@@ -1065,7 +1134,15 @@ class DurableRuntime:
             approval.actor = "system"
             approval.decided_at = now
             step = session.get(StepRecord, (run.id, approval.node_id))
-            _event(session, run, "approval.cancelled", now, step, step.attempt_number)
+            _event(
+                session,
+                run,
+                "approval.cancelled",
+                now,
+                step,
+                step.attempt_number,
+                subject=str(approval.id),
+            )
         for step in self._steps(session, run.id).values():
             if step.state in {StepState.SUCCEEDED, StepState.SKIPPED, StepState.FAILED}:
                 continue
@@ -1120,6 +1197,7 @@ class DurableRuntime:
                     now,
                     step,
                     step.attempt_number,
+                    subject=operation.operation_id,
                 )
         return bool(operations)
 
@@ -1190,6 +1268,17 @@ class DurableRuntime:
                 .where(ModelCallRecord.run_id == run_id)
                 .order_by(ModelCallRecord.node_id, ModelCallRecord.round_number)
             )
+            definition = session.get(
+                WorkflowVersion, (run.workflow_name, run.workflow_version)
+            ).definition
+            graph = tuple(
+                {
+                    key: node[key]
+                    for key in ("id", "parents", "routes", "when", "join_selected")
+                    if key in node
+                }
+                for node in definition["nodes"]
+            )
             return RunHistory(
                 run,
                 tuple(self._steps(session, run_id).values()),
@@ -1198,4 +1287,5 @@ class DurableRuntime:
                 tuple(operations),
                 tuple(approvals),
                 tuple(model_calls),
+                graph,
             )

@@ -12,11 +12,12 @@ for the full scope and the [README](README.md) for setup and demo commands.
 | Week 4 · Retries, deadlines, and tool effects | Persisted capped retry delays and deadlines, added timer processing, and implemented the tool-operation ledger with an independent SQLite ticket receiver. Unknown outcomes from non-idempotent writes require reconciliation. | `0270c34` |
 | Week 5 · Approvals, API, and cancellation | Added operator and reviewer HTTP endpoints, approval tied to the exact tool action, database-enforced decision expiry, and cooperative cancellation. | `1872a58` |
 | Week 6 · Fan-out, conditional branches, and joins | Independent steps run concurrently. Conditions select routes, unselected paths become `SKIPPED`, and a selected-parent join runs once with its inputs in declared order. A retry preserves committed sibling outputs. | `fbb86d3`, `0b24afe` |
-| Week 7 · Durable incident investigator | Checkpointed bounded model rounds and tool results, added the deterministic and OpenAI adapters, and built parallel investigators that validate evidence before escalation or approved ticket creation. | Investigator milestone |
+| Week 7 · Durable incident investigator | Checkpointed bounded model rounds and tool results, added the deterministic and OpenAI adapters, and built parallel investigators that validate evidence before escalation or approved ticket creation. | `803cfba` |
+| Week 8 · Inspection and observability | Added an authenticated run and approval console, correlated events and OpenTelemetry spans, structured worker logs, reported usage summaries, and credential-field redaction. | Inspection milestone |
 
 ### Verification
 
-- All 41 tests passed, including 28 integration tests against PostgreSQL 17.
+- All 44 tests passed, including 30 integration tests against PostgreSQL 17.
   The integration suite covers restart and version pinning, worker death and
   stale completion, competing claims, rollback before commit, concurrent join
   scheduling, and failure propagation.
@@ -34,6 +35,10 @@ for the full scope and the [README](README.md) for setup and demo commands.
   prompted by malicious evidence, and exact-action approval. Recovery tests
   verify reuse of completed rounds and atomic budget reservation. The OpenAI
   adapter was tested with a mocked HTTP transport.
+- A headless Chrome smoke test loaded a pending incident run, reviewed its
+  evidence references, approved the exact ticket action, and displayed the
+  completed run. Integration tests also check trace propagation, event
+  correlation, usage accounting, and redaction.
 - Alembic upgrade, schema check, and downgrade passed. The incident CLI demo
   reached `SUCCEEDED` with two separate worker invocations.
 - Ruff lint checks passed.
@@ -42,6 +47,5 @@ for the full scope and the [README](README.md) for setup and demo commands.
 
 | Plan milestone | Work to do | Exit check |
 | --- | --- | --- |
-| Week 8 · Inspection and observability | Build the run timeline and approval UI. Add trace correlation, model usage accounting, and redaction. | A reviewer can inspect a run from API request through approval and tool result. |
 | Week 9 · Evaluation and benchmarks | Expand the fault suite, freeze the synthetic evaluation cases, compare the agent workflow with a baseline, and measure worker throughput and recovery latency. | Documented commands reproduce the evaluation and benchmark reports. |
 | Week 10 · Deployment and demo | Add Docker Compose, CI with PostgreSQL, architecture decision records, a failure postmortem, and demo instructions and recording. | A clean checkout can run the sample with two workers and reproduce the crash and approval scenarios. |
