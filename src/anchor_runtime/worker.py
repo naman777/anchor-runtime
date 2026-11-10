@@ -8,6 +8,7 @@ from sqlalchemy.exc import OperationalError
 
 from anchor_runtime.durable import Claim, DurableRuntime
 from anchor_runtime.policy import RetryableError
+from anchor_runtime.tools import ApprovalWait
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,8 @@ def work_once(runtime: DurableRuntime, owner: str) -> bool:
     try:
         try:
             output = runtime.execute(claim)
+        except ApprovalWait:
+            return True
         except OperationalError:
             raise
         except Exception as error:

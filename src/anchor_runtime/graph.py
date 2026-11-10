@@ -20,11 +20,16 @@ class StepContext:
     run_input: BaseModel
     parents: Mapping[str, BaseModel]
     _call_tool: ToolCaller | None = field(default=None, repr=False)
+    _should_stop: Callable[[], bool] | None = field(default=None, repr=False)
 
     def call_tool(self, name: str, operation_id: str, arguments: object) -> object:
         if self._call_tool is None:
             raise RuntimeError("Tool calls require a durable worker")
         return self._call_tool(name, operation_id, arguments)
+
+    def should_stop(self) -> bool:
+        """Check whether cancellation, a deadline, or lease loss ended this attempt."""
+        return self._should_stop is not None and self._should_stop()
 
     def input_as(self, schema: type[Model]) -> Model:
         if not isinstance(self.run_input, schema):

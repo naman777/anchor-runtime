@@ -100,3 +100,31 @@ Workers process due timers when they poll. Run `uv run python -m anchor_runtime.
 scheduler` to advance timers while workers are busy. Deadlines fence checkpoint
 and tool writes. Synchronous handler code and a receiver's already-dispatched
 work can continue until they return.
+
+## Approval API demo
+
+Apply the migrations and set `ANCHOR_DATABASE_URL` and `ANCHOR_TICKET_DB` for
+the API and workers. Configure an `ANCHOR_OPERATOR_TOKEN` and set
+`ANCHOR_REVIEWER_TOKENS` to a JSON object mapping reviewer names to distinct
+bearer tokens. These credentials are for a trusted single-project deployment.
+
+```sh
+uv run uvicorn anchor_runtime.api:app_from_env --factory
+```
+
+Use the API documentation at `http://127.0.0.1:8000/docs`.
+
+1. As the operator, POST to `/workflows/approved-ticket/1/runs` with an
+   `input` object containing `service` and `title`. Run a worker to create
+   the pending approval and release its lease.
+2. As the reviewer, GET `/approvals`. Review the destination, arguments, and
+   decision deadline. POST the listed `action_digest`, `approve`, and
+   optional `reason` to `/approvals/{approval_id}/decision`.
+3. After approval, a worker resumes the step and dispatches the exact action.
+   As the operator, GET `/runs/{run_id}` to see the result and history.
+
+The approval deadline bounds the time to make a decision. Rejection and expiry
+end the run and record the outcome. Cancellation through
+`POST /runs/{run_id}/cancel` closes pending approvals and fences further
+checkpoints and dispatch reservations. Handlers can check
+`context.should_stop()` for cooperative cancellation.

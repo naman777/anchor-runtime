@@ -11,8 +11,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
 
 from anchor_runtime.durable import DurableRuntime
-from anchor_runtime.example import FakeProvider, incident_workflow
-from anchor_runtime.tickets import TicketService, ticket_workflow
+from anchor_runtime.example import demo_workflows
 from anchor_runtime.worker import work_once
 
 
@@ -27,6 +26,7 @@ def main() -> None:
     ticket.add_argument("service")
     ticket.add_argument("title")
     ticket.add_argument("--key")
+    ticket.add_argument("--approval", action="store_true")
     worker = commands.add_parser("worker")
     worker.add_argument("--once", action="store_true")
     commands.add_parser("scheduler")
@@ -38,25 +38,19 @@ def main() -> None:
     if not url:
         parser.error("Set ANCHOR_DATABASE_URL to a PostgreSQL connection URL")
     logging.basicConfig(level=logging.INFO)
-    workflow = incident_workflow(FakeProvider())
-    workflows = [workflow]
-    if ticket_db := os.environ.get("ANCHOR_TICKET_DB"):
-        workflows.append(ticket_workflow(TicketService(ticket_db)))
-    elif args.command == "start-ticket":
+    ticket_db = os.environ.get("ANCHOR_TICKET_DB")
+    if args.command == "start-ticket" and not ticket_db:
         parser.error("Set ANCHOR_TICKET_DB to the mock receiver's SQLite file")
     engine = create_engine(url, pool_pre_ping=True)
     try:
-        runtime = DurableRuntime(engine, workflows)
+        runtime = DurableRuntime(engine, demo_workflows(ticket_db))
         if args.command == "start":
             payload = {"service": args.service, "error_rate": args.error_rate}
-            print(
-                runtime.start(
-                    workflow.name, workflow.version, payload, idempotency_key=args.key
-                )
-            )
+            print(runtime.start("incident", "1", payload, idempotency_key=args.key))
         elif args.command == "start-ticket":
             payload = {"service": args.service, "title": args.title}
-            print(runtime.start("ticket-demo", "1", payload, idempotency_key=args.key))
+            name = "approved-ticket" if args.approval else "ticket-demo"
+            print(runtime.start(name, "1", payload, idempotency_key=args.key))
         elif args.command == "inspect":
             history = runtime.inspect(args.run_id)
             if history is None:
@@ -73,6 +67,13 @@ def main() -> None:
                 print(step.node_id, step.state, step.output)
             for operation in history.operations:
                 print(operation.node_id, operation.operation_id, operation.state)
+            for approval in history.approvals:
+                print(
+                    approval.id,
+                    approval.node_id,
+                    approval.state,
+                    approval.deadline.isoformat(),
+                )
         elif args.command == "worker":
             owner = f"{socket.gethostname()}:{os.getpid()}"
             if args.once:

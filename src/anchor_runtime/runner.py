@@ -1,6 +1,6 @@
 """Sequential reference runner and shared handler invocation."""
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -28,6 +28,7 @@ def execute_node(
     run_input: str,
     parent_outputs: Mapping[str, str],
     call_tool: ToolCaller | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> str:
     node = workflow.nodes_by_id[node_id]
     parents = {}
@@ -43,6 +44,7 @@ def execute_node(
         run_input=workflow.input_schema.model_validate_json(run_input, by_name=True),
         parents=MappingProxyType(parents),
         _call_tool=call_tool,
+        _should_stop=should_stop,
     )
     return encode_checkpoint(handler.output_schema, handler.execute(context))
 

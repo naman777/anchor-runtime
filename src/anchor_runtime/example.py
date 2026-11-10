@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from anchor_runtime.graph import Handler, Node, StepContext, Workflow
 from anchor_runtime.runner import run
+from anchor_runtime.tickets import TicketService, ticket_workflow
 
 
 class Incident(BaseModel):
@@ -63,10 +64,22 @@ def incident_workflow(provider: AssessmentProvider) -> Workflow:
 
 
 def main() -> None:
-    result = run(incident_workflow(FakeProvider()), {"service": "checkout", "error_rate": 0.08})
+    result = run(
+        incident_workflow(FakeProvider()), {"service": "checkout", "error_rate": 0.08}
+    )
     for event in result.events:
         print(event.type, event.node_id or "")
     print(json.dumps(json.loads(result.outputs["assessment"]), indent=2))
+
+
+def demo_workflows(ticket_db: str | None = None) -> list[Workflow]:
+    workflows = [incident_workflow(FakeProvider())]
+    if ticket_db:
+        service = TicketService(ticket_db)
+        workflows.extend(
+            [ticket_workflow(service), ticket_workflow(service, protected=True)]
+        )
+    return workflows
 
 
 if __name__ == "__main__":

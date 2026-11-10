@@ -49,19 +49,27 @@ class TicketService:
             return {"id": ticket_id}
 
 
-def ticket_workflow(service: TicketService) -> Workflow:
+def ticket_workflow(service: TicketService, *, protected: bool = False) -> Workflow:
     def create_ticket(context: StepContext) -> Ticket:
         request = context.input_as(TicketRequest)
         result = context.call_tool("create_ticket", "incident-ticket", request)
         return Ticket.model_validate(result)
 
     return Workflow(
-        "ticket-demo",
+        "approved-ticket" if protected else "ticket-demo",
         "1",
         TicketRequest,
         (Node("ticket", "ticket", "1", retry=RetryPolicy(), tools=("create_ticket",)),),
         (Handler("ticket", "1", Ticket, create_ticket),),
         tools=(
-            Tool("create_ticket", "1", TicketRequest, service.create, idempotent=True),
+            Tool(
+                "create_ticket",
+                "1",
+                TicketRequest,
+                service.create,
+                idempotent=True,
+                requires_approval=protected,
+                destination="Mock incident ticket queue",
+            ),
         ),
     )

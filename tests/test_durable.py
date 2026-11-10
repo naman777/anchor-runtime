@@ -12,8 +12,10 @@ from uuid import UUID, uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, func, select, text, update
 
+from anchor_runtime.api import create_app
 from anchor_runtime.durable import (
     Claim,
     DurableRuntime,
@@ -24,6 +26,8 @@ from anchor_runtime.example import FakeProvider, incident_workflow
 from anchor_runtime.graph import Handler, Node, Workflow
 from anchor_runtime.policy import RetryableError, RetryPolicy
 from anchor_runtime.storage import (
+    ApprovalRecord,
+    ApprovalState,
     AttemptState,
     OperationState,
     RunRecord,
@@ -448,3 +452,181 @@ def test_tool_operation_id_binds_arguments(engine, tmp_path):
         runtime.call_tool(
             claim, "create_ticket", "incident-ticket", {**payload, "title": "Different"}
         )
+
+
+TICKET_PAYLOAD = {"service": "checkout", "title": "Elevated errors"}
+OPERATOR = {"Authorization": "Bearer operator-secret"}
+REVIEWER = {"Authorization": "Bearer reviewer-secret"}
+
+
+def _review_api(runtime):
+    return TestClient(
+        create_app(
+            runtime,
+            operator_token="operator-secret",
+            reviewers={"oncall": "reviewer-secret"},
+        )
+    )
+
+
+def test_approval_api_survives_restart_and_is_bound_to_action(engine, tmp_path):
+    workflow = ticket_workflow(
+        TicketService(tmp_path / "receiver.sqlite"), protected=True
+    )
+    runtime = DurableRuntime(engine, [workflow])
+    with _review_api(runtime) as client:
+        start = client.post(
+            "/workflows/approved-ticket/1/runs",
+            headers=OPERATOR,
+            json={"input": TICKET_PAYLOAD, "idempotency_key": "incident"},
+        )
+        assert start.status_code == 202
+        run_id = UUID(start.json()["id"])
+
+    assert work_once(runtime, "first")
+    assert not work_once(runtime, "other")
+    history = runtime.inspect(run_id)
+    assert history.operations == ()
+    assert history.steps[0].state == StepState.WAITING_APPROVAL
+    assert history.attempts[0].state == AttemptState.WAITING_APPROVAL
+    restarted = DurableRuntime(engine, [workflow])
+    with _review_api(restarted) as client:
+        assert client.get("/approvals").status_code in {401, 403}
+        assert client.get("/approvals", headers=OPERATOR).status_code == 403
+        assert client.get(f"/runs/{run_id}", headers=REVIEWER).status_code == 403
+        (approval,) = client.get("/approvals", headers=REVIEWER).json()
+        assert approval["arguments"] == TICKET_PAYLOAD
+        assert approval["destination"] == "Mock incident ticket queue"
+        path = f"/approvals/{approval['id']}/decision"
+        decision = {
+            "approve": True,
+            "reason": "Verified incident",
+            "action_digest": approval["action_digest"],
+        }
+        assert client.post(path, headers=OPERATOR, json=decision).status_code == 403
+        assert (
+            client.post(
+                path, headers=REVIEWER, json={**decision, "action_digest": "0" * 64}
+            ).status_code
+            == 409
+        )
+        first = client.post(path, headers=REVIEWER, json=decision)
+        assert first.status_code == 200
+        assert first.json()["actor"] == "oncall"
+        assert client.post(path, headers=REVIEWER, json=decision).json() == first.json()
+        assert (
+            client.post(
+                path, headers=REVIEWER, json={**decision, "approve": False}
+            ).status_code
+            == 409
+        )
+
+        resumed = restarted.claim("second")
+        with pytest.raises(ToolConflict, match="different action"):
+            restarted.call_tool(
+                resumed,
+                "create_ticket",
+                "incident-ticket",
+                {**TICKET_PAYLOAD, "title": "Changed"},
+            )
+        output = restarted.execute(resumed)
+        assert restarted.succeed(resumed, output)
+        completed = client.get(f"/runs/{run_id}", headers=OPERATOR).json()
+        assert completed["state"] == "SUCCEEDED"
+        assert [event["type"] for event in completed["events"]].count(
+            "approval.approved"
+        ) == 1
+        assert client.get("/approvals", headers=REVIEWER).json() == []
+
+
+def test_approval_racing_expiry_resolves_only_once(engine, tmp_path):
+    workflow = ticket_workflow(
+        TicketService(tmp_path / "receiver.sqlite"), protected=True
+    )
+    runtime = DurableRuntime(engine, [workflow])
+    run_id = runtime.start("approved-ticket", "1", TICKET_PAYLOAD)
+    assert work_once(runtime, "worker")
+    (approval,) = runtime.pending_approvals()
+    _make_due(engine, ApprovalRecord, run_id, deadline=func.clock_timestamp())
+    barrier = Barrier(2, timeout=10)
+
+    def reviewer():
+        barrier.wait()
+        return runtime.decide_approval(
+            approval.id, approval.action_digest, approve=True, actor="oncall"
+        )
+
+    def scheduler():
+        barrier.wait()
+        return runtime.advance_timers()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        decision = pool.submit(reviewer)
+        expiry = pool.submit(scheduler)
+        assert decision.result(timeout=10).state == ApprovalState.EXPIRED
+        expiry.result(timeout=10)
+    history = runtime.inspect(run_id)
+    assert history.run.state == RunState.FAILED
+    assert sum(event.type == "approval.expired" for event in history.events) == 1
+    assert all(event.type != "approval.approved" for event in history.events)
+    assert runtime.claim("replacement") is None
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_rejection_and_cancellation_close_protected_path(engine, tmp_path, cancel):
+    workflow = ticket_workflow(
+        TicketService(tmp_path / "receiver.sqlite"), protected=True
+    )
+    runtime = DurableRuntime(engine, [workflow])
+    run_id = runtime.start("approved-ticket", "1", TICKET_PAYLOAD)
+    assert work_once(runtime, "worker")
+    (approval,) = runtime.pending_approvals()
+    if cancel:
+        assert runtime.cancel(run_id) == RunState.CANCELLED
+        assert runtime.cancel(run_id) == RunState.CANCELLED
+        decision = runtime.decide_approval(
+            approval.id, approval.action_digest, approve=True, actor="oncall"
+        )
+        assert decision.state == ApprovalState.CANCELLED
+    else:
+        decision = runtime.decide_approval(
+            approval.id,
+            approval.action_digest,
+            approve=False,
+            actor="oncall",
+            reason="Unsafe",
+        )
+        assert decision.state == ApprovalState.REJECTED
+        assert decision.reason == "Unsafe"
+    history = runtime.inspect(run_id)
+    assert history.operations == ()
+    assert history.steps[0].state == StepState.CANCELLED
+    assert runtime.claim("replacement") is None
+
+
+def test_cancel_running_step_rejects_late_result_and_downstream_work(engine, workflow):
+    def collect(context):
+        assert context.should_stop()
+        return workflow.handlers[0].execute(context)
+
+    cancellable = replace(
+        workflow,
+        handlers=(replace(workflow.handlers[0], execute=collect), workflow.handlers[1]),
+    )
+    runtime = DurableRuntime(engine, [cancellable])
+    run_id = runtime.start("incident", "1", PAYLOAD)
+    claim = runtime.claim("worker")
+    with _review_api(runtime) as client:
+        assert (
+            client.post(f"/runs/{run_id}/cancel", headers=REVIEWER).status_code == 403
+        )
+        assert (
+            client.post(f"/runs/{run_id}/cancel", headers=OPERATOR).json()["state"]
+            == "CANCELLED"
+        )
+    assert not runtime.renew(claim)
+    assert not runtime.succeed(claim, runtime.execute(claim))
+    assert runtime.claim("replacement") is None
+    history = runtime.inspect(run_id)
+    assert history.attempts[0].state == AttemptState.CANCELLED
+    assert all(step.state == StepState.CANCELLED for step in history.steps)

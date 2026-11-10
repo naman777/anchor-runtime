@@ -14,6 +14,7 @@ class RunState(StrEnum):
     ACTIVE = "ACTIVE"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class StepState(StrEnum):
@@ -21,6 +22,7 @@ class StepState(StrEnum):
     READY = "READY"
     RUNNING = "RUNNING"
     RETRY_WAIT = "RETRY_WAIT"
+    WAITING_APPROVAL = "WAITING_APPROVAL"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
@@ -31,6 +33,7 @@ class AttemptState(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     LEASE_EXPIRED = "LEASE_EXPIRED"
+    WAITING_APPROVAL = "WAITING_APPROVAL"
     CANCELLED = "CANCELLED"
 
 
@@ -38,6 +41,14 @@ class OperationState(StrEnum):
     DISPATCHING = "DISPATCHING"
     SUCCEEDED = "SUCCEEDED"
     NEEDS_RECONCILIATION = "NEEDS_RECONCILIATION"
+
+
+class ApprovalState(StrEnum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
+    CANCELLED = "CANCELLED"
 
 
 class Base(DeclarativeBase):
@@ -123,6 +134,7 @@ class AttemptRecord(Base):
             native_enum=False,
             create_constraint=True,
             name="attempt_state",
+            length=32,
         )
     )
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -164,3 +176,37 @@ class ToolOperation(Base):
         )
     )
     result: Mapped[Any] = mapped_column(JSONB(none_as_null=True), nullable=True)
+
+
+class ApprovalRecord(Base):
+    __tablename__ = "approvals"
+    __table_args__ = (
+        ForeignKeyConstraint(["run_id", "node_id"], ["steps.run_id", "steps.node_id"]),
+        Index(
+            "ix_approvals_pending",
+            "deadline",
+            "id",
+            postgresql_where=text("state = 'PENDING'"),
+        ),
+    )
+
+    run_id: Mapped[UUID] = mapped_column(primary_key=True)
+    node_id: Mapped[str] = mapped_column(primary_key=True)
+    operation_id: Mapped[str] = mapped_column(primary_key=True)
+    id: Mapped[UUID] = mapped_column(unique=True)
+    tool_name: Mapped[str]
+    destination: Mapped[str]
+    action_digest: Mapped[str]
+    arguments: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    state: Mapped[ApprovalState] = mapped_column(
+        Enum(
+            ApprovalState,
+            native_enum=False,
+            create_constraint=True,
+            name="approval_state",
+        )
+    )
+    actor: Mapped[str | None]
+    reason: Mapped[str | None]
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

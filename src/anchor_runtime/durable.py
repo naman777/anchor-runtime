@@ -16,6 +16,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from anchor_runtime.graph import Workflow
 from anchor_runtime.runner import encode_checkpoint, encode_input, execute_node
 from anchor_runtime.storage import (
+    ApprovalRecord,
+    ApprovalState,
     AttemptRecord,
     AttemptState,
     EventRecord,
@@ -28,8 +30,10 @@ from anchor_runtime.storage import (
     WorkflowVersion,
 )
 from anchor_runtime.tools import (
+    ApprovalWait,
     LeaseLost,
     ReconciliationRequired,
+    Tool,
     ToolCaller,
     ToolConflict,
 )
@@ -43,6 +47,10 @@ class RequestConflict(ValueError):
     """An idempotency key already belongs to a different request."""
 
 
+class ApprovalConflict(ValueError):
+    """An approval decision conflicts with the action or recorded decision."""
+
+
 @dataclass(frozen=True, slots=True)
 class Claim:
     run_id: UUID
@@ -53,13 +61,18 @@ class Claim:
     run_input: str
     parent_outputs: tuple[tuple[str, str], ...]
 
-    def execute(self, call_tool: ToolCaller | None = None) -> str:
+    def execute(
+        self,
+        call_tool: ToolCaller | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> str:
         return execute_node(
             self.workflow,
             self.node_id,
             self.run_input,
             dict(self.parent_outputs),
             call_tool,
+            should_stop,
         )
 
 
@@ -70,6 +83,7 @@ class RunHistory:
     attempts: tuple[AttemptRecord, ...]
     events: tuple[EventRecord, ...]
     operations: tuple[ToolOperation, ...]
+    approvals: tuple[ApprovalRecord, ...]
 
 
 def _json(value: object) -> str:
@@ -116,6 +130,14 @@ def _definition(workflow: Workflow) -> dict:
                     "schema": tool.input_schema.model_json_schema(),
                     "idempotent": tool.idempotent,
                     "requires_approval": tool.requires_approval,
+                    **(
+                        {
+                            "destination": tool.destination,
+                            "approval_timeout": tool.approval_timeout.total_seconds(),
+                        }
+                        if tool.requires_approval
+                        else {}
+                    ),
                 }
                 for tool in (
                     workflow.tools_by_name[name] for name in sorted(node.tools)
@@ -351,8 +373,18 @@ class DurableRuntime:
             & or_(StepRecord.deadline <= time, StepRecord.lease_expires_at <= time),
         )
         with self._sessions.begin() as session:
+            expired_approval = (
+                select(ApprovalRecord.id)
+                .where(
+                    ApprovalRecord.run_id == RunRecord.id,
+                    ApprovalRecord.state == ApprovalState.PENDING,
+                    ApprovalRecord.deadline <= time,
+                )
+                .exists()
+            )
             run = self._next_run(
-                session, or_(RunRecord.deadline <= time, self._has_step(due))
+                session,
+                or_(RunRecord.deadline <= time, self._has_step(due), expired_approval),
             )
             if run is None:
                 return False
@@ -360,6 +392,22 @@ class DurableRuntime:
             if run.deadline is not None and run.deadline <= now:
                 _event(session, run, "run.deadline_exceeded", now)
                 self._terminate(session, run, now)
+                return True
+
+            approval = session.scalar(
+                select(ApprovalRecord)
+                .where(
+                    ApprovalRecord.run_id == run.id,
+                    ApprovalRecord.state == ApprovalState.PENDING,
+                    ApprovalRecord.deadline <= now,
+                )
+                .order_by(ApprovalRecord.deadline, ApprovalRecord.id)
+                .limit(1)
+            )
+            if approval is not None:
+                self._record_approval(
+                    session, run, approval, ApprovalState.EXPIRED, "system", None, now
+                )
                 return True
 
             for step in self._steps(session, run.id).values():
@@ -422,8 +470,163 @@ class DurableRuntime:
         return claim.execute(
             lambda name, operation_id, arguments: self.call_tool(
                 claim, name, operation_id, arguments
-            )
+            ),
+            lambda: not self._claim_active(claim),
         )
+
+    def _claim_active(self, claim: Claim) -> bool:
+        with self._sessions.begin() as session:
+            return self._lock_claim(session, claim) is not None
+
+    def _require_approval(
+        self,
+        claim: Claim,
+        tool: Tool,
+        operation_id: str,
+        arguments: object,
+        digest: str,
+    ) -> None:
+        with self._sessions.begin() as session:
+            current = self._lock_claim(session, claim)
+            if current is None:
+                raise LeaseLost("Cannot request approval without a current lease")
+            run, step, now = current
+            approval = session.get(ApprovalRecord, (run.id, step.node_id, operation_id))
+            if approval is not None:
+                if approval.action_digest != digest:
+                    raise ToolConflict("Approval belongs to a different action")
+                if approval.state != ApprovalState.APPROVED:
+                    raise ApprovalConflict("Protected action has no valid approval")
+                return
+            session.add(
+                ApprovalRecord(
+                    run_id=run.id,
+                    node_id=step.node_id,
+                    operation_id=operation_id,
+                    id=uuid4(),
+                    tool_name=tool.name,
+                    destination=tool.destination,
+                    action_digest=digest,
+                    arguments=arguments,
+                    deadline=now + tool.approval_timeout,
+                    state=ApprovalState.PENDING,
+                )
+            )
+            step.state = StepState.WAITING_APPROVAL
+            _clear_lease(step)
+            attempt = session.get(AttemptRecord, (run.id, step.node_id, claim.number))
+            attempt.state = AttemptState.WAITING_APPROVAL
+            attempt.finished_at = now
+            _event(session, run, "approval.requested", now, step, claim.number)
+        raise ApprovalWait("The protected action is waiting for approval")
+
+    def pending_approvals(self, *, limit: int = 100) -> tuple[ApprovalRecord, ...]:
+        with self._sessions() as session:
+            time = func.statement_timestamp()
+            return tuple(
+                session.scalars(
+                    select(ApprovalRecord)
+                    .join(RunRecord, RunRecord.id == ApprovalRecord.run_id)
+                    .where(
+                        ApprovalRecord.state == ApprovalState.PENDING,
+                        ApprovalRecord.deadline > time,
+                        RunRecord.state == RunState.ACTIVE,
+                        or_(RunRecord.deadline.is_(None), RunRecord.deadline > time),
+                    )
+                    .order_by(ApprovalRecord.deadline, ApprovalRecord.id)
+                    .limit(limit)
+                )
+            )
+
+    def decide_approval(
+        self,
+        approval_id: UUID,
+        action_digest: str,
+        *,
+        approve: bool,
+        actor: str,
+        reason: str | None = None,
+    ) -> ApprovalRecord | None:
+        if not actor:
+            raise ValueError("Reviewer identity is required")
+        decision = ApprovalState.APPROVED if approve else ApprovalState.REJECTED
+        with self._sessions.begin() as session:
+            run_id = session.scalar(
+                select(ApprovalRecord.run_id).where(ApprovalRecord.id == approval_id)
+            )
+            if run_id is None:
+                return None
+            run = session.get(RunRecord, run_id, with_for_update=True)
+            approval = session.scalar(
+                select(ApprovalRecord).where(ApprovalRecord.id == approval_id)
+            )
+            if approval.action_digest != action_digest:
+                raise ApprovalConflict("Action digest does not match the request")
+            if approval.state in {ApprovalState.EXPIRED, ApprovalState.CANCELLED}:
+                return approval
+            if approval.state != ApprovalState.PENDING:
+                if (approval.state, approval.actor, approval.reason) != (
+                    decision,
+                    actor,
+                    reason,
+                ):
+                    raise ApprovalConflict("Approval already has a different decision")
+                return approval
+            now = _now(session)
+            if run.deadline is not None and run.deadline <= now:
+                _event(session, run, "run.deadline_exceeded", now)
+                self._terminate(session, run, now)
+            elif approval.deadline <= now:
+                self._record_approval(
+                    session, run, approval, ApprovalState.EXPIRED, "system", None, now
+                )
+            else:
+                self._record_approval(
+                    session, run, approval, decision, actor, reason, now
+                )
+            return approval
+
+    def _record_approval(
+        self,
+        session: Session,
+        run: RunRecord,
+        approval: ApprovalRecord,
+        decision: ApprovalState,
+        actor: str,
+        reason: str | None,
+        now: datetime,
+    ) -> None:
+        approval.state = decision
+        approval.actor = actor
+        approval.reason = reason
+        approval.decided_at = now
+        step = session.get(StepRecord, (run.id, approval.node_id))
+        _event(
+            session,
+            run,
+            f"approval.{decision.value.lower()}",
+            now,
+            step,
+            step.attempt_number,
+        )
+        if decision == ApprovalState.APPROVED:
+            self._make_ready(session, run, step, now)
+        else:
+            self._terminate(session, run, now)
+
+    def cancel(self, run_id: UUID) -> RunState | None:
+        with self._sessions.begin() as session:
+            run = session.get(RunRecord, run_id, with_for_update=True)
+            if run is None:
+                return None
+            if run.state == RunState.ACTIVE:
+                now = _now(session)
+                if run.deadline is not None and run.deadline <= now:
+                    _event(session, run, "run.deadline_exceeded", now)
+                    self._terminate(session, run, now)
+                else:
+                    self._terminate(session, run, now, state=RunState.CANCELLED)
+            return run.state
 
     def call_tool(
         self, claim: Claim, name: str, operation_id: str, arguments: object
@@ -435,12 +638,22 @@ class DurableRuntime:
         if not operation_id or len(operation_id) > 200:
             raise ValueError("Operation ID must contain 1 to 200 characters")
         tool = workflow.tools_by_name[name]
-        if tool.requires_approval:
-            raise PermissionError("Protected tool requires a durable approval")
         encoded = encode_checkpoint(tool.input_schema, arguments)
         payload = json.loads(encoded)
         validated = tool.input_schema.model_validate_json(encoded, by_name=True)
         digest = _digest([tool.name, tool.version, payload])
+        if tool.requires_approval:
+            digest = _digest(
+                [
+                    workflow.name,
+                    workflow.version,
+                    tool.destination,
+                    tool.name,
+                    tool.version,
+                    payload,
+                ]
+            )
+            self._require_approval(claim, tool, operation_id, payload, digest)
         identity = (claim.run_id, claim.node_id, operation_id)
         key = _digest([str(claim.run_id), claim.node_id, operation_id])
         needs_reconciliation = False
@@ -449,6 +662,11 @@ class DurableRuntime:
             if current is None:
                 raise LeaseLost("Cannot dispatch without a current lease")
             run, step, now = current
+            if (
+                not tool.requires_approval
+                and session.get(ApprovalRecord, identity) is not None
+            ):
+                raise ToolConflict("Operation ID already belongs to a protected action")
             operation = session.get(ToolOperation, identity)
             if operation is None:
                 session.add(
@@ -583,6 +801,17 @@ class DurableRuntime:
             retryable = False
             error_type = "ReconciliationRequired"
         number = step.attempt_number
+        charged_attempts = number
+        if retryable and policy is not None:
+            charged_attempts -= session.scalar(
+                select(func.count())
+                .select_from(AttemptRecord)
+                .where(
+                    AttemptRecord.run_id == run.id,
+                    AttemptRecord.node_id == step.node_id,
+                    AttemptRecord.state == AttemptState.WAITING_APPROVAL,
+                )
+            )
         attempt = session.get(AttemptRecord, (run.id, step.node_id, number))
         attempt.state = AttemptState.LEASE_EXPIRED if expired else AttemptState.FAILED
         attempt.finished_at = now
@@ -598,17 +827,39 @@ class DurableRuntime:
         )
         if retryable and expired and policy is None:
             self._make_ready(session, run, step, now)
-        elif retryable and policy is not None and number < policy.max_attempts:
+        elif (
+            retryable and policy is not None and charged_attempts < policy.max_attempts
+        ):
             step.state = StepState.RETRY_WAIT
             step.next_attempt_at = now + max(
-                retry_after, policy.delay(number, self._jitter())
+                retry_after, policy.delay(charged_attempts, self._jitter())
             )
             _event(session, run, "step.retry_scheduled", now, step, number)
         else:
             step.state = StepState.FAILED
             self._terminate(session, run, now)
 
-    def _terminate(self, session: Session, run: RunRecord, now: datetime) -> None:
+    def _terminate(
+        self,
+        session: Session,
+        run: RunRecord,
+        now: datetime,
+        *,
+        state: RunState = RunState.FAILED,
+    ) -> None:
+        for approval in session.scalars(
+            select(ApprovalRecord)
+            .where(
+                ApprovalRecord.run_id == run.id,
+                ApprovalRecord.state == ApprovalState.PENDING,
+            )
+            .order_by(ApprovalRecord.node_id, ApprovalRecord.operation_id)
+        ):
+            approval.state = ApprovalState.CANCELLED
+            approval.actor = "system"
+            approval.decided_at = now
+            step = session.get(StepRecord, (run.id, approval.node_id))
+            _event(session, run, "approval.cancelled", now, step, step.attempt_number)
         for step in self._steps(session, run.id).values():
             if step.state in {StepState.SUCCEEDED, StepState.FAILED}:
                 continue
@@ -623,8 +874,8 @@ class DurableRuntime:
             step.next_attempt_at = None
             _clear_lease(step)
             _event(session, run, "step.cancelled", now, step, number)
-        run.state = RunState.FAILED
-        _event(session, run, "run.failed", now)
+        run.state = state
+        _event(session, run, f"run.{state.value.lower()}", now)
 
     @staticmethod
     def _make_ready(
@@ -711,10 +962,16 @@ class DurableRuntime:
                 .where(ToolOperation.run_id == run_id)
                 .order_by(ToolOperation.node_id, ToolOperation.operation_id)
             )
+            approvals = session.scalars(
+                select(ApprovalRecord)
+                .where(ApprovalRecord.run_id == run_id)
+                .order_by(ApprovalRecord.node_id, ApprovalRecord.operation_id)
+            )
             return RunHistory(
                 run,
                 tuple(self._steps(session, run_id).values()),
                 tuple(attempts),
                 tuple(events),
                 tuple(operations),
+                tuple(approvals),
             )

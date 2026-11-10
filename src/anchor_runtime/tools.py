@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 from pydantic import BaseModel
@@ -17,10 +18,16 @@ class Tool:
     dispatch: Callable[[str, BaseModel], Any]
     idempotent: bool = False
     requires_approval: bool = False
+    destination: str | None = None
+    approval_timeout: timedelta = timedelta(hours=1)
 
     def __post_init__(self) -> None:
         if not self.name or not self.version:
             raise ValueError("Tool name and version are required")
+        if self.requires_approval and not self.destination:
+            raise ValueError("A protected tool requires a reviewer-visible destination")
+        if self.approval_timeout <= timedelta(0):
+            raise ValueError("Approval timeout must be positive")
 
 
 class ToolConflict(ValueError):
@@ -33,3 +40,7 @@ class ReconciliationRequired(RuntimeError):
 
 class LeaseLost(RuntimeError):
     """The calling attempt can no longer perform durable operations."""
+
+
+class ApprovalWait(RuntimeError):
+    """The runtime committed an approval request and released the attempt."""
